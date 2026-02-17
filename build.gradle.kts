@@ -11,7 +11,6 @@ repositories {
 val quarkusPlatformVersion: String by project
 val temporalSdkVersion: String by project
 val exposedVersion: String by project
-val quarkusTemporalVersion: String by project
 
 dependencies {
     // Quarkus BOM
@@ -27,10 +26,7 @@ dependencies {
     implementation("io.quarkus:quarkus-agroal")
     implementation("io.quarkus:quarkus-narayana-jta")
 
-    // Temporal via Quarkiverse extension
-    implementation("io.quarkiverse.temporal:quarkus-temporal:$quarkusTemporalVersion")
-
-    // Temporal SDK (explicit for Schedule APIs and advanced features)
+    // Temporal SDK
     implementation("io.temporal:temporal-sdk:$temporalSdkVersion")
 
     // Kotlin Exposed DSL for Oracle DB operations

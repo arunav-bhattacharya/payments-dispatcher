@@ -7,7 +7,6 @@ import com.payment.dispatcher.payment.model.PaymentExecContext
 import com.payment.dispatcher.payment.model.PaymentRequest
 import com.payment.dispatcher.payment.model.RoutingDetails
 import com.payment.dispatcher.payment.model.ValidationResult
-import io.quarkiverse.temporal.TemporalActivity
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import org.jboss.logging.Logger
@@ -23,7 +22,6 @@ import java.time.ZonedDateTime
  * external services, rules engines, etc.
  */
 @ApplicationScoped
-@TemporalActivity(workers = ["payment-init-worker"])
 class PaymentInitActivitiesImpl : PaymentInitActivities {
 
     @Inject

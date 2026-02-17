@@ -1,7 +1,8 @@
 package com.payment.dispatcher.payment.init
 
-import com.payment.dispatcher.payment.context.PaymentContextActivities
-import io.quarkiverse.temporal.TemporalWorkflow
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.kotlin.kotlinModule
+import com.payment.dispatcher.framework.workflow.ScheduleLifecycle
 import io.temporal.activity.ActivityOptions
 import io.temporal.common.RetryOptions
 import io.temporal.workflow.Workflow
@@ -10,13 +11,20 @@ import java.time.Duration
 /**
  * Phase A implementation: runs all initial processing activities,
  * persists the payment as SCHEDULED, builds accumulated context,
- * saves it to Oracle, and enqueues for dispatch.
+ * and schedules for dispatch via [ScheduleLifecycle].
  *
- * After saveContextAndEnqueue, the workflow returns "ENQUEUED" and COMPLETES.
+ * The scheduling concern (context persistence + enqueueing) is
+ * abstracted into [ScheduleLifecycle] — this workflow only contains
+ * pure business logic and a single `schedule()` call at the end.
+ *
+ * After scheduling, the workflow returns "ENQUEUED" and COMPLETES.
  * No Workflow.sleep() — the payment waits in Oracle until dispatch time.
  */
-@TemporalWorkflow(workers = ["payment-init-worker"])
 class PaymentInitWorkflowImpl : PaymentInitWorkflow {
+
+    companion object {
+        private val objectMapper = ObjectMapper().registerModule(kotlinModule())
+    }
 
     private val initActivities = Workflow.newActivityStub(
         PaymentInitActivities::class.java,
@@ -30,17 +38,7 @@ class PaymentInitWorkflowImpl : PaymentInitWorkflow {
             .build()
     )
 
-    private val contextActivities = Workflow.newActivityStub(
-        PaymentContextActivities::class.java,
-        ActivityOptions.newBuilder()
-            .setStartToCloseTimeout(Duration.ofSeconds(30))
-            .setRetryOptions(
-                RetryOptions.newBuilder()
-                    .setMaximumAttempts(3)
-                    .build()
-            )
-            .build()
-    )
+    private val scheduleLifecycle = ScheduleLifecycle("PAYMENT")
 
     override fun initializePayment(paymentId: String, requestJson: String): String {
         // ═══ Phase A: Validate and enrich ═══
@@ -63,9 +61,8 @@ class PaymentInitWorkflowImpl : PaymentInitWorkflow {
         // ═══ Determine execution time ═══
         val scheduledExecTime = initActivities.determineExecTime(paymentId, requestJson)
 
-        // ═══ Save context FIRST, then enqueue (ordering matters for failure safety) ═══
-        val workflowId = Workflow.getInfo().workflowId
-        contextActivities.saveContextAndEnqueue(context, scheduledExecTime, workflowId)
+        // ═══ Schedule for dispatch (context save + enqueue) ═══
+        scheduleLifecycle.schedule(objectMapper.writeValueAsString(context), scheduledExecTime)
 
         // Workflow COMPLETES — no more sleeping!
         return "ENQUEUED"

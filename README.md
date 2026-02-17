@@ -40,7 +40,7 @@ This reduces Temporal DB pressure by **~200x** (from 500K sleeping workflows to 
 - Each cycle: read config (kill switch) → recover stale claims → claim batch → dispatch → record results
 - Batch claim JOINs with context table to **pre-load JSON CLOB** — no separate Oracle round-trip per execution
 - Exec workflows started with `startDelay()` jitter to prevent thundering herd
-- Exec workflows extend `DispatchableWorkflow` — dispatch lifecycle (complete/fail/cleanup) handled by the framework, business logic is isolated in `doExecute()`
+- Exec workflows are pure business logic with zero dispatch framework awareness — they receive `contextJson` as a parameter, deserialize it, and execute. The dispatcher manages queue status externally
 - Payment transitions: `SCHEDULED` → `ACCEPTED` → `PROCESSING`
 
 **Observability**
@@ -58,7 +58,7 @@ graph TB
         RULES --> PERSIST["Persist SCHEDULED Payment"]
         PERSIST --> BUILD_CTX["Build Context"]
         BUILD_CTX --> SAVE_CTX["Save Context (CLOB)"]
-        SAVE_CTX --> ENQUEUE["Enqueue (READY)"]
+        SAVE_CTX -->|"ScheduleLifecycle"| ENQUEUE["Enqueue (READY)"]
         ENQUEUE --> COMPLETE_A["Workflow Completes"]
     end
 
@@ -75,11 +75,9 @@ graph TB
         CLAIM --> ORACLE_Q
         CLAIM --> ORACLE_CTX
         CLAIM --> DISPATCH["Dispatch Batch\n(pass contextJson)"]
-        DISPATCH -->|"startDelay(jitter)\n+ contextJson param"| EXEC_WF["PaymentExecWorkflow\n(extends DispatchableWorkflow)"]
-        EXEC_WF --> EXECUTE["doExecute:\nExecute → PostProcess → Notify"]
-        EXECUTE --> LIFECYCLE["DispatchableWorkflow:\ncompleteItem / failItem"]
-        LIFECYCLE --> ORACLE_Q
-        LIFECYCLE --> ORACLE_CTX
+        DISPATCH -->|"startDelay(jitter)\n+ contextJson param"| EXEC_WF["PaymentExecWorkflow\n(pure business logic)"]
+        EXEC_WF --> EXECUTE["Execute → PostProcess → Notify"]
+        EXECUTE --> DONE["Workflow completes\n(Temporal manages lifecycle)"]
     end
 
     subgraph "Observability"
@@ -107,9 +105,8 @@ sequenceDiagram
     participant Oracle as Oracle (Queue + Context)
     participant PDB as Payments DB
     participant T as Temporal Server
-    participant EW as PaymentExecWorkflow<br/>(extends DispatchableWorkflow)
+    participant EW as PaymentExecWorkflow<br/>(pure business logic)
     participant EA as ExecActivities
-    participant DA as DispatcherActivities
 
     rect rgb(235, 245, 255)
     Note over Client,CA: Phase A — Payment Initialization
@@ -119,7 +116,8 @@ sequenceDiagram
     IW->>IA: persistScheduledPayment
     IA->>PDB: INSERT payment (status = SCHEDULED)
     IW->>IA: buildContext + determineExecTime
-    IW->>CA: saveContextAndEnqueue(context, execTime)
+    IW->>IW: ScheduleLifecycle.schedule(contextJson, execTime)
+    IW->>CA: saveContextAndEnqueue(itemType, contextJson, execTime, workflowId)
     CA->>Oracle: INSERT context CLOB + INSERT queue (READY)
     Note over IW: Workflow completes immediately
     end
@@ -133,23 +131,16 @@ sequenceDiagram
     end
 
     rect rgb(235, 255, 235)
-    Note over T,DA: Phase B — Payment Execution (after startDelay)
+    Note over T,EW: Phase B — Payment Execution (after startDelay)
 
     T->>EW: execute(paymentId, contextJson)
-    Note over EW: DispatchableWorkflow.executeWithLifecycle()
 
-    EW->>EW: doExecute: deserialize contextJson
+    EW->>EW: deserialize contextJson
     EW->>EA: executePayment (SCHEDULED → ACCEPTED)
     EW->>EA: postProcess
     EW->>EA: sendNotifications (ACCEPTED → PROCESSING)
 
-    alt Success
-        EW->>DA: completeItem(paymentId)
-        DA->>Oracle: DISPATCHED → COMPLETED + DELETE context
-    else Failure
-        EW->>DA: failItem(paymentId, error)
-        DA->>Oracle: DISPATCHED → FAILED / DEAD_LETTER
-    end
+    Note over EW: Workflow completes (Temporal manages lifecycle)
     end
 ```
 
@@ -230,16 +221,10 @@ sequenceDiagram
 
     DW-->>S: done (workflow completes)
 
-    Note over T,EW: After startDelay — DispatchableWorkflow handles lifecycle
+    Note over T,EW: After startDelay — Pure business logic executes
     T->>EW: execute(paymentId, contextJson)
-    EW->>EW: doExecute (business logic only)
-    alt Success
-        EW->>DA: completeItem(paymentId)
-        DA->>OQ: DISPATCHED → COMPLETED + delete context
-    else Failure
-        EW->>DA: failItem(paymentId, itemType, error)
-        DA->>OQ: DISPATCHED → FAILED / DEAD_LETTER
-    end
+    EW->>EW: deserialize contextJson + execute business logic
+    Note over EW: Workflow completes (stale recovery handles failures)
 ```
 
 ---
@@ -555,6 +540,8 @@ payment-dispatch/
         │
         ├── config/
         │   ├── AppConfig.kt                  # @ConfigMapping for dispatch settings
+        │   ├── TemporalConfig.kt             # Temporal client + worker configuration
+        │   ├── WorkerConfig.kt               # Worker registration and task queue setup
         │   └── DispatchScheduleInitializer.kt # Creates Temporal Schedule on startup
         │
         ├── framework/                        # ── Generic Dispatch Infrastructure ──
@@ -580,11 +567,12 @@ payment-dispatch/
         │   │   └── ExposedContextService.kt      # Exposed + Jackson implementation
         │   │
         │   ├── activity/
-        │   │   ├── DispatcherActivities.kt       # @ActivityInterface (7 methods)
-        │   │   └── DispatcherActivitiesImpl.kt   # Core dispatch + lifecycle logic
+        │   │   ├── DispatcherActivities.kt       # @ActivityInterface (5 methods)
+        │   │   ├── DispatcherActivitiesImpl.kt   # Core dispatch logic
+        │   │   └── SchedulableContextActivities.kt # @ActivityInterface for context + enqueue
         │   │
         │   ├── workflow/
-        │   │   ├── DispatchableWorkflow.kt       # Abstract base (Template Method)
+        │   │   ├── ScheduleLifecycle.kt           # Composable lifecycle helper
         │   │   ├── DispatcherWorkflow.kt         # @WorkflowInterface
         │   │   └── DispatcherWorkflowImpl.kt     # 5-step dispatch cycle
         │   │
@@ -604,8 +592,7 @@ payment-dispatch/
             │   └── PaymentStatus.kt              # SCHEDULED / ACCEPTED / PROCESSING
             │
             ├── context/
-            │   ├── PaymentContextActivities.kt   # @ActivityInterface (Phase A only)
-            │   └── PaymentContextActivitiesImpl.kt # Composes generic services
+            │   └── PaymentContextActivitiesImpl.kt # Implements SchedulableContextActivities
             │
             ├── init/                             # Phase A
             │   ├── PaymentInitWorkflow.kt        # @WorkflowInterface
@@ -615,7 +602,7 @@ payment-dispatch/
             │
             └── exec/                             # Phase B
                 ├── PaymentExecWorkflow.kt        # @WorkflowInterface
-                ├── PaymentExecWorkflowImpl.kt    # extends DispatchableWorkflow (business logic only)
+                ├── PaymentExecWorkflowImpl.kt    # Pure business logic (zero framework awareness)
                 ├── PaymentExecActivities.kt      # @ActivityInterface
                 └── PaymentExecActivitiesImpl.kt  # Business logic stubs
 ```
@@ -707,44 +694,45 @@ graph LR
 - **One fewer failure mode** — if context load failed before, the exec workflow would be stuck in CLAIMED; now the context is guaranteed available at workflow start
 - **Context is immutable** — Phase A output doesn't change after enqueueing, so pre-loading introduces no staleness risk
 
-### Composition + Template Method
+### Composition via Lifecycle Helpers
 
-The framework layer is generic and reusable. Payment-specific implementations compose generic services and extend the `DispatchableWorkflow` base:
+The framework layer is generic and reusable. Payment-specific implementations compose framework helpers — no inheritance required. Exec workflows are pure business logic with zero framework awareness:
 
 ```mermaid
 graph TB
     subgraph "Framework (Generic)"
-        DW["DispatchableWorkflow\n(abstract base)"]
-        DA["DispatcherActivities\n(completeItem / failItem)"]
+        SL["ScheduleLifecycle\n(composable helper)"]
+        SCA["SchedulableContextActivities\n(@ActivityInterface)"]
         ECS["ExposedContextService&lt;T&gt;"]
         DQR["DispatchQueueRepository"]
     end
 
     subgraph "Payment Domain (Specific)"
-        PEW["PaymentExecWorkflowImpl\n(doExecute: business logic only)"]
-        PCA["PaymentContextActivitiesImpl\n(Phase A only)"]
+        PIW["PaymentInitWorkflowImpl\n(uses ScheduleLifecycle)"]
+        PEW["PaymentExecWorkflowImpl\n(pure business logic —\nzero framework dependency)"]
+        PCA["PaymentContextActivitiesImpl\n(implements SchedulableContextActivities)"]
     end
 
-    PEW -->|"extends"| DW
-    DW -->|"calls"| DA
-    DA -->|"uses"| DQR
+    PIW -->|"composes"| SL
+    PCA -->|"implements"| SCA
     PCA -->|"composes"| ECS
     PCA -->|"composes"| DQR
 
-    style DW fill:#89b4fa,stroke:#1e66f5
-    style DA fill:#89b4fa,stroke:#1e66f5
+    style SL fill:#89b4fa,stroke:#1e66f5
+    style SCA fill:#89b4fa,stroke:#1e66f5
     style ECS fill:#89b4fa,stroke:#1e66f5
     style DQR fill:#89b4fa,stroke:#1e66f5
+    style PIW fill:#a6e3a1,stroke:#40a02b
     style PEW fill:#a6e3a1,stroke:#40a02b
     style PCA fill:#a6e3a1,stroke:#40a02b
 ```
 
 To add a new domain (e.g., invoices):
 1. Insert config row in `EXEC_RATE_CONFIG` (`item_type='INVOICE'`)
-2. Create `InvoiceExecContext`, `InvoiceInitWorkflow`
-3. Create `InvoiceExecWorkflowImpl extends DispatchableWorkflow` — implement `doExecute()` only
-4. Create `InvoiceContextActivitiesImpl` composing the same generic services
-5. No changes to the framework layer — lifecycle handled by `DispatchableWorkflow`
+2. Create `InvoiceExecContext`, `InvoiceInitWorkflow` (compose `ScheduleLifecycle` in init workflow)
+3. Create `InvoiceExecWorkflowImpl` — pure business logic, receives `contextJson`, no framework dependency
+4. Create `InvoiceContextActivitiesImpl` implementing `SchedulableContextActivities`
+5. No changes to the framework layer
 
 ---
 
@@ -758,17 +746,14 @@ flowchart TD
 
     F2["WorkflowClient.start()\nfails for an item"] --> R2["Reset to READY\nimmediately\n(retry_count++)"]
 
-    F3["Exec workflow fails\n(exception thrown)"] --> R3{"retry_count + 1\n>= maxRetries?"}
-    R3 -->|No| R3A["Mark FAILED\n(retry next cycle)"]
-    R3 -->|Yes| R3B["Mark DEAD_LETTER\n(terminal — alert fires)"]
+    F3["Exec workflow fails\n(Temporal records failure)"] --> R3A["Stale recovery detects\nDISPATCHED item with\nno running workflow\n→ reset to READY"]
 
     F4["Context pre-load fails\n(during claimBatch)"] -->|"Batch claim fails entirely\nnext cycle retries"| R2B["Items remain CLAIMED\n→ stale recovery"]
     R2B --> R1
 
     style R1A fill:#a6e3a1,stroke:#40a02b
     style R2 fill:#a6e3a1,stroke:#40a02b
-    style R3A fill:#f9e2af,stroke:#e6a817
-    style R3B fill:#f38ba8,stroke:#d20f39
+    style R3A fill:#a6e3a1,stroke:#40a02b
     style R1B fill:#89b4fa,stroke:#1e66f5
 ```
 
@@ -780,9 +765,9 @@ Three dedicated workers with isolated task queues:
 
 | Worker | Task Queue | Workflows | Activities | Concurrency |
 |--------|-----------|-----------|------------|-------------|
-| **dispatch-worker** | `dispatch-task-queue` | DispatcherWorkflow | DispatcherActivities (dispatch + lifecycle) | 5 WF / 10 Act |
-| **payment-init-worker** | `payment-init-task-queue` | PaymentInitWorkflow | PaymentInitActivities, PaymentContextActivities | 100 WF / 200 Act |
-| **payment-exec-worker** | `payment-exec-task-queue` | PaymentExecWorkflow | PaymentExecActivities, DispatcherActivities | 100 WF / 200 Act |
+| **dispatch-worker** | `dispatch-task-queue` | DispatcherWorkflow | DispatcherActivities | 5 WF / 10 Act |
+| **payment-init-worker** | `payment-init-task-queue` | PaymentInitWorkflow | PaymentInitActivities, SchedulableContextActivities | 100 WF / 200 Act |
+| **payment-exec-worker** | `payment-exec-task-queue` | PaymentExecWorkflow | PaymentExecActivities | 100 WF / 200 Act |
 
 ---
 
@@ -864,7 +849,6 @@ UPDATE EXEC_RATE_CONFIG SET jitter_window_ms = 8000 WHERE item_type = 'PAYMENT';
 | **Kotlin** | 2.1.0 | Language (JVM 21) |
 | **Quarkus** | 3.29.4 | Application framework (CDI, REST, health, config) |
 | **Temporal SDK** | 1.31.0 | Workflow orchestration |
-| **Quarkiverse Temporal** | 0.2.2 | Quarkus-Temporal integration |
 | **Kotlin Exposed** | 0.61.0 | Type-safe SQL DSL (Oracle) |
 | **Oracle** | — | Dispatch queue, context persistence, config, audit |
 | **Agroal** | (Quarkus-managed) | Oracle connection pooling (5–20 connections) |

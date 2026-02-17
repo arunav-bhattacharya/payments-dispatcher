@@ -2,9 +2,7 @@ package com.payment.dispatcher.payment.exec
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.kotlinModule
-import com.payment.dispatcher.framework.workflow.DispatchableWorkflow
 import com.payment.dispatcher.payment.model.PaymentExecContext
-import io.quarkiverse.temporal.TemporalWorkflow
 import io.temporal.activity.ActivityOptions
 import io.temporal.common.RetryOptions
 import io.temporal.workflow.Workflow
@@ -13,17 +11,16 @@ import java.time.Duration
 /**
  * Phase B implementation: pure payment business logic.
  *
- * Extends [DispatchableWorkflow] which handles all dispatch lifecycle concerns
- * (marking COMPLETED/FAILED/DEAD_LETTER, context CLOB cleanup) via the
- * template method pattern. This class only contains business logic.
+ * This workflow has zero awareness of the dispatch framework.
+ * It receives a pre-loaded contextJson parameter, deserializes it,
+ * and executes the payment business logic — nothing more.
  *
- * Context is pre-loaded by the dispatcher at claim time and passed as a
- * JSON string parameter — no Oracle round-trip needed.
+ * The dispatch framework (DispatcherActivitiesImpl) starts this workflow
+ * and manages queue status transitions externally. Stale recovery
+ * handles any orphaned CLAIMED items if the dispatcher crashes
+ * between claiming and starting the workflow.
  */
-@TemporalWorkflow(workers = ["payment-exec-worker"])
-class PaymentExecWorkflowImpl : DispatchableWorkflow(), PaymentExecWorkflow {
-
-    override val itemType: String = "PAYMENT"
+class PaymentExecWorkflowImpl : PaymentExecWorkflow {
 
     companion object {
         private val objectMapper = ObjectMapper().registerModule(kotlinModule())
@@ -42,10 +39,6 @@ class PaymentExecWorkflowImpl : DispatchableWorkflow(), PaymentExecWorkflow {
     )
 
     override fun execute(paymentId: String, contextJson: String) {
-        executeWithLifecycle(paymentId, contextJson)
-    }
-
-    override fun doExecute(paymentId: String, contextJson: String) {
         val context = objectMapper.readValue(contextJson, PaymentExecContext::class.java)
 
         // Execute the actual payment (debit, credit, settlement)

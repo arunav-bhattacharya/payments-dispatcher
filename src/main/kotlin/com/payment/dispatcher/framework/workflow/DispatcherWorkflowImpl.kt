@@ -1,7 +1,6 @@
 package com.payment.dispatcher.framework.workflow
 
 import com.payment.dispatcher.framework.activity.DispatcherActivities
-import io.quarkiverse.temporal.TemporalWorkflow
 import io.temporal.activity.ActivityOptions
 import io.temporal.common.RetryOptions
 import io.temporal.workflow.Workflow
@@ -21,7 +20,6 @@ import java.time.Duration
  * Activity retry policy: maxAttempts=1.
  * A failed cycle is simply picked up by the next scheduled invocation.
  */
-@TemporalWorkflow(workers = ["dispatch-worker"])
 class DispatcherWorkflowImpl : DispatcherWorkflow {
 
     private val activities = Workflow.newActivityStub(

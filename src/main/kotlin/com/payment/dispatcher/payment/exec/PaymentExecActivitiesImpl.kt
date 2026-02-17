@@ -2,7 +2,6 @@ package com.payment.dispatcher.payment.exec
 
 import com.payment.dispatcher.payment.model.PaymentExecContext
 import com.payment.dispatcher.payment.model.PaymentStatus
-import io.quarkiverse.temporal.TemporalActivity
 import jakarta.enterprise.context.ApplicationScoped
 import org.jboss.logging.Logger
 
@@ -15,7 +14,6 @@ import org.jboss.logging.Logger
  *   ACCEPTED  → PROCESSING (after notifications sent to all parties)
  */
 @ApplicationScoped
-@TemporalActivity(workers = ["payment-exec-worker"])
 class PaymentExecActivitiesImpl : PaymentExecActivities {
 
     companion object {

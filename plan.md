@@ -88,39 +88,46 @@ Originally, `PaymentExecWorkflowImpl` called `contextActivities.loadContext(paym
 
 ---
 
-## Phase 4: `DispatchableWorkflow` Template Method
+## Phase 4: Composition via Lifecycle Helpers
 
 ### Problem
 
-`PaymentExecWorkflowImpl` mixed business logic with dispatch infrastructure:
-- `contextActivities.completeAndCleanup(paymentId)` — marks queue COMPLETED + deletes CLOB
-- `contextActivities.markFailed(paymentId, error)` — marks queue FAILED/DEAD_LETTER
+`PaymentExecWorkflowImpl` mixed business logic with dispatch infrastructure (queue status transitions, context cleanup). Similarly, `PaymentInitWorkflowImpl` mixed business logic with scheduling infrastructure (context persistence, enqueueing).
 
-### Solution: Template Method Pattern
+### Solution: Composable Lifecycle Helpers
 
+Instead of inheritance (template method), use composition:
+
+**Phase A — `ScheduleLifecycle` (composable helper):**
 ```
-DispatchableWorkflow (abstract, framework layer)
-├── executeWithLifecycle(paymentId, contextJson)
-│   ├── Calls doExecute(paymentId, contextJson)  ← subclass implements
-│   ├── On success: dispatcherActivities.completeItem(paymentId)
-│   └── On failure: dispatcherActivities.failItem(paymentId, itemType, error)
-│
-PaymentExecWorkflowImpl extends DispatchableWorkflow
-└── doExecute(paymentId, contextJson)
-    ├── Deserialize context
-    ├── executePayment(context)
-    ├── postProcess(context)
-    └── sendNotifications(context)
+PaymentInitWorkflowImpl
+├── initActivities.validate/enrich/applyRules/persist/buildContext/determineExecTime
+└── scheduleLifecycle.schedule(contextJson, scheduledExecTime)
+    └── SchedulableContextActivities.saveContextAndEnqueue(itemType, contextJson, execTime, workflowId)
 ```
+
+**Phase B — Pure business logic (no helper needed):**
+```
+PaymentExecWorkflowImpl (zero framework awareness)
+├── Deserialize contextJson
+├── execActivities.executePayment(context)
+├── execActivities.postProcess(context)
+└── execActivities.sendNotifications(context)
+```
+
+The exec workflow has no dispatch framework imports. The dispatcher manages queue status externally. Stale recovery handles orphaned CLAIMED items.
 
 ### Changes Made
 
-- **`DispatchableWorkflow`** (NEW) — abstract base in `framework/workflow/`, owns `DispatcherActivities` stub, implements lifecycle template
-- **`DispatcherActivities`** — added `completeItem(itemId)` and `failItem(itemId, itemType, error)`
-- **`DispatcherActivitiesImpl`** — implements `completeItem` (markCompleted + delete context) and `failItem` (markFailed/dead-letter), registered on both `dispatch-worker` and `payment-exec-worker`
-- **`PaymentExecWorkflowImpl`** — extends `DispatchableWorkflow`, implements only `doExecute()` with pure business logic
-- **`PaymentContextActivities`** — became Phase A-only (`saveContextAndEnqueue` only), removed `completeAndCleanup` and `markFailed`
-- **`PaymentContextActivitiesImpl`** — removed unused injections (`configRepo`, `metrics`), worker changed to `payment-init-worker` only
+- **`ScheduleLifecycle`** (NEW) — composable helper in `framework/workflow/`, holds `SchedulableContextActivities` stub, captures workflow ID automatically
+- **`SchedulableContextActivities`** (NEW) — framework-level `@ActivityInterface` for generic context save + enqueue
+- **`PaymentContextActivitiesImpl`** — implements `SchedulableContextActivities` (was `PaymentContextActivities`), receives `contextJson` + `itemType` as parameters
+- **`PaymentContextActivities`** — DELETED (replaced by framework-level `SchedulableContextActivities`)
+- **`PaymentExecWorkflowImpl`** — pure business logic, zero framework awareness, no dispatch imports
+- **`PaymentInitWorkflowImpl`** — composes `ScheduleLifecycle`, single `schedule()` call at end
+- **`DispatchableWorkflow`** — DELETED (replaced by composition approach)
+- **`DispatcherActivities`** — removed `completeItem`/`failItem` (5 methods, down from 7)
+- **`DispatcherActivitiesImpl`** — registered on `dispatch-worker` only (was `dispatch-worker` + `payment-exec-worker`)
 
 ---
 
@@ -175,7 +182,7 @@ PaymentExecWorkflowImpl extends DispatchableWorkflow
 |---------|----------|
 | Dispatcher crashes after claiming batch | Stale recovery (next cycle detects `claimed_at > threshold`, checks Temporal, resets to READY) |
 | `WorkflowClient.start()` fails | Reset to READY immediately (`retry_count++`) |
-| Exec workflow fails (exception) | `DispatchableWorkflow` calls `failItem()` → FAILED or DEAD_LETTER |
+| Exec workflow fails (exception) | Temporal records failure; stale recovery detects DISPATCHED item with no running workflow → reset to READY |
 | Context pre-load fails during claimBatch | Batch claim fails entirely, items remain CLAIMED → stale recovery |
 
 ---
@@ -187,7 +194,6 @@ PaymentExecWorkflowImpl extends DispatchableWorkflow
 | Kotlin | 2.1.0 | Language (JVM 21) |
 | Quarkus | 3.29.4 | Application framework |
 | Temporal SDK | 1.31.0 | Workflow orchestration |
-| Quarkiverse Temporal | 0.2.2 | Quarkus-Temporal integration |
 | Kotlin Exposed | 0.61.0 | Type-safe SQL DSL (Oracle) |
 | Oracle | — | Dispatch queue, context, config, audit |
 | Agroal | (Quarkus) | Oracle connection pooling (5-20) |
@@ -214,7 +220,9 @@ payment-dispatch/
     │
     └── kotlin/com/payment/dispatcher/
         ├── config/
-        │   ├── AppConfig.kt
+        │   ├── AppConfig.kt                     (+ temporal, workers config)
+        │   ├── TemporalConfig.kt                CDI producer: WorkflowServiceStubs, WorkflowClient
+        │   ├── WorkerConfig.kt                  Manual worker creation + registration
         │   └── DispatchScheduleInitializer.kt
         │
         ├── framework/
@@ -232,10 +240,11 @@ payment-dispatch/
         │   │   ├── ExecutionContextService.kt
         │   │   └── ExposedContextService.kt
         │   ├── activity/
-        │   │   ├── DispatcherActivities.kt       (7 methods: 5 dispatch + completeItem + failItem)
-        │   │   └── DispatcherActivitiesImpl.kt   (workers: dispatch + payment-exec)
+        │   │   ├── DispatcherActivities.kt       (5 methods: dispatch only)
+        │   │   ├── DispatcherActivitiesImpl.kt   (worker: dispatch only)
+        │   │   └── SchedulableContextActivities.kt  Framework interface for context save + enqueue
         │   ├── workflow/
-        │   │   ├── DispatchableWorkflow.kt       ← NEW: abstract base, template method
+        │   │   ├── ScheduleLifecycle.kt          Composable helper for Phase A scheduling
         │   │   ├── DispatcherWorkflow.kt
         │   │   └── DispatcherWorkflowImpl.kt
         │   ├── schedule/
@@ -249,18 +258,17 @@ payment-dispatch/
             ├── model/
             │   ├── PaymentRequest.kt
             │   ├── PaymentExecContext.kt          (no fee fields)
-            │   └── PaymentStatus.kt              ← NEW: SCHEDULED/ACCEPTED/PROCESSING
+            │   └── PaymentStatus.kt               SCHEDULED/ACCEPTED/PROCESSING
             ├── context/
-            │   ├── PaymentContextActivities.kt   (Phase A only: saveContextAndEnqueue)
-            │   └── PaymentContextActivitiesImpl.kt (worker: payment-init only)
+            │   └── PaymentContextActivitiesImpl.kt (implements SchedulableContextActivities)
             ├── init/
             │   ├── PaymentInitWorkflow.kt
-            │   ├── PaymentInitWorkflowImpl.kt    (+ persistScheduledPayment, no fees)
+            │   ├── PaymentInitWorkflowImpl.kt    (composes ScheduleLifecycle)
             │   ├── PaymentInitActivities.kt
             │   └── PaymentInitActivitiesImpl.kt  (specific imports)
             └── exec/
                 ├── PaymentExecWorkflow.kt        (execute(paymentId, contextJson))
-                ├── PaymentExecWorkflowImpl.kt    (extends DispatchableWorkflow, doExecute only)
+                ├── PaymentExecWorkflowImpl.kt    (pure business logic, zero framework awareness)
                 ├── PaymentExecActivities.kt
                 └── PaymentExecActivitiesImpl.kt
 ```

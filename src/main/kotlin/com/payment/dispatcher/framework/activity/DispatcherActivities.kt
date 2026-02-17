@@ -51,20 +51,4 @@ interface DispatcherActivities {
      */
     @ActivityMethod
     fun recordResults(batchId: String, results: List<DispatchResult>, config: DispatchConfig)
-
-    /**
-     * Marks a dispatched item as COMPLETED and deletes its context CLOB.
-     * Called by DispatchableWorkflow on successful execution.
-     */
-    @ActivityMethod
-    fun completeItem(itemId: String)
-
-    /**
-     * Marks a dispatched item as FAILED (or DEAD_LETTER if retries exhausted)
-     * and records the error. Called by DispatchableWorkflow on execution failure.
-     *
-     * @return true if the item was moved to DEAD_LETTER
-     */
-    @ActivityMethod
-    fun failItem(itemId: String, itemType: String, error: String?)
 }

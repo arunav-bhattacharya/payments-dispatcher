@@ -26,8 +26,22 @@ interface AppConfig {
     @WithDefault("5")
     fun dispatchIntervalSecs(): Int
 
+    /** Temporal connection configuration */
+    fun temporal(): TemporalConfig
+
     /** Task queue configuration */
     fun taskQueues(): TaskQueuesConfig
+
+    /** Worker concurrency configuration */
+    fun workers(): WorkersConfig
+
+    interface TemporalConfig {
+        @WithDefault("localhost:7233")
+        fun target(): String
+
+        @WithDefault("default")
+        fun namespace(): String
+    }
 
     interface TaskQueuesConfig {
         @WithDefault("dispatch-task-queue")
@@ -38,5 +52,19 @@ interface AppConfig {
 
         @WithDefault("payment-exec-task-queue")
         fun paymentExec(): String
+    }
+
+    interface WorkersConfig {
+        fun dispatch(): WorkerConcurrencyConfig
+        fun paymentInit(): WorkerConcurrencyConfig
+        fun paymentExec(): WorkerConcurrencyConfig
+    }
+
+    interface WorkerConcurrencyConfig {
+        @WithDefault("5")
+        fun maxConcurrentWorkflows(): Int
+
+        @WithDefault("10")
+        fun maxConcurrentActivities(): Int
     }
 }

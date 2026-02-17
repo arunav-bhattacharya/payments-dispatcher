@@ -1,29 +1,28 @@
 package com.payment.dispatcher.payment.context
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.payment.dispatcher.framework.activity.SchedulableContextActivities
 import com.payment.dispatcher.framework.context.ExposedContextService
 import com.payment.dispatcher.framework.repository.DispatchQueueRepository
 import com.payment.dispatcher.payment.model.PaymentExecContext
-import io.quarkiverse.temporal.TemporalActivity
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import org.jboss.logging.Logger
 import java.time.Instant
 
 /**
- * Payment-specific context activities — Phase A only.
- * Composes generic framework services with payment-specific types.
+ * Payment-specific implementation of [SchedulableContextActivities].
  *
- * Dispatch lifecycle concerns (complete, fail, cleanup) are handled by
- * DispatchableWorkflow + DispatcherActivities at the framework level.
+ * Handles saving the accumulated PaymentExecContext as a JSON CLOB
+ * and enqueueing the payment for dispatch. Called by [ScheduleLifecycle]
+ * at the end of Phase A (init workflow).
  *
  * This is the key composition seam: another domain (e.g., Invoice)
- * would create InvoiceContextActivitiesImpl composing the same
- * generic services with InvoiceExecContext.
+ * would create InvoiceContextActivitiesImpl implementing the same
+ * [SchedulableContextActivities] interface with InvoiceExecContext.
  */
 @ApplicationScoped
-@TemporalActivity(workers = ["payment-init-worker"])
-class PaymentContextActivitiesImpl : PaymentContextActivities {
+class PaymentContextActivitiesImpl : SchedulableContextActivities {
 
     @Inject
     lateinit var objectMapper: ObjectMapper
@@ -38,21 +37,23 @@ class PaymentContextActivitiesImpl : PaymentContextActivities {
 
     companion object {
         private val log = Logger.getLogger(PaymentContextActivitiesImpl::class.java)
-        private const val ITEM_TYPE = "PAYMENT"
     }
 
     override fun saveContextAndEnqueue(
-        context: PaymentExecContext,
+        itemType: String,
+        contextJson: String,
         scheduledExecTime: String,
         initWorkflowId: String?
     ) {
+        val context = objectMapper.readValue(contextJson, PaymentExecContext::class.java)
+
         // Save context FIRST — if enqueue fails, orphaned context is harmless
-        contextService.save(context.paymentId, ITEM_TYPE, context)
+        contextService.save(context.paymentId, itemType, context)
 
         // Then enqueue for dispatch
         queueRepo.enqueue(
             itemId = context.paymentId,
-            itemType = ITEM_TYPE,
+            itemType = itemType,
             scheduledExecTime = Instant.parse(scheduledExecTime),
             initWorkflowId = initWorkflowId
         )

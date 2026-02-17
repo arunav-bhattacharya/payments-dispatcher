@@ -8,38 +8,32 @@ dispatch:
   schedule-id: dispatch-payment-schedule
   auto-create-schedule: true
   dispatch-interval-secs: 5
+
+  # --- Temporal Connection ---------------------------------------------------
+  temporal:
+    target: "${TEMPORAL_TARGET:localhost:7233}"
+    namespace: "${TEMPORAL_NAMESPACE:default}"
+
+  # --- Task Queues -----------------------------------------------------------
   task-queues:
     dispatcher: dispatch-task-queue
     payment-init: payment-init-task-queue
     payment-exec: payment-exec-task-queue
 
-# --- Temporal ----------------------------------------------------------------
+  # --- Worker Concurrency ----------------------------------------------------
+  workers:
+    dispatch:
+      max-concurrent-workflows: 5
+      max-concurrent-activities: 10
+    payment-init:
+      max-concurrent-workflows: 100
+      max-concurrent-activities: 200
+    payment-exec:
+      max-concurrent-workflows: 100
+      max-concurrent-activities: 200
+
+# --- Quarkus Configuration ---------------------------------------------------
 quarkus:
-  temporal:
-    connection:
-      target: "${TEMPORAL_TARGET:localhost:7233}"
-    namespace: "${TEMPORAL_NAMESPACE:default}"
-    start-workers: true
-
-    worker:
-      # Dispatcher worker: lightweight, runs dispatch cycles every 5 seconds
-      dispatch-worker:
-        task-queue: dispatch-task-queue
-        max-concurrent-activity-execution-size: 10
-        max-concurrent-workflow-task-execution-size: 5
-
-      # Payment init worker: runs Phase A (validation, enrichment, rules, fees)
-      payment-init-worker:
-        task-queue: payment-init-task-queue
-        max-concurrent-activity-execution-size: 200
-        max-concurrent-workflow-task-execution-size: 100
-
-      # Payment exec worker: runs Phase B (actual payment execution)
-      payment-exec-worker:
-        task-queue: payment-exec-task-queue
-        max-concurrent-activity-execution-size: 200
-        max-concurrent-workflow-task-execution-size: 100
-
   # --- Oracle Datasource (Agroal connection pool) ----------------------------
   datasource:
     db-kind: oracle
