@@ -12,9 +12,9 @@ import io.temporal.client.WorkflowClient
 import io.temporal.client.WorkflowExecutionAlreadyStarted
 import io.temporal.client.WorkflowNotFoundException
 import io.temporal.client.WorkflowOptions
+import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
-import org.jboss.logging.Logger
 import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
@@ -29,6 +29,8 @@ import java.util.concurrent.ThreadLocalRandom
  * Exec workflows are completely decoupled — the dispatcher only starts them and
  * hands off control to Temporal. Stale recovery handles orphaned CLAIMED items.
  */
+private val logger = KotlinLogging.logger {}
+
 @ApplicationScoped
 class DispatcherActivitiesImpl : DispatcherActivities {
 
@@ -46,10 +48,6 @@ class DispatcherActivitiesImpl : DispatcherActivities {
 
     @Inject
     lateinit var metrics: DispatchMetrics
-
-    companion object {
-        private val log = Logger.getLogger(DispatcherActivitiesImpl::class.java)
-    }
 
     // ═══════════════════════════════════════════════════════════════════
     // Read Config
@@ -97,13 +95,12 @@ class DispatcherActivitiesImpl : DispatcherActivities {
                 recoveredCount++
                 metrics.recordStaleRecovery()
             } else {
-                log.debugf("Stale claim for %s has running exec workflow %s — skipping recovery",
-                    claim.itemId, claim.execWorkflowId)
+                logger.debug { "Stale claim for ${claim.itemId} has running exec workflow ${claim.execWorkflowId} — skipping recovery" }
             }
         }
 
         if (recoveredCount > 0) {
-            log.infof("Recovered %d stale claims for itemType=%s", recoveredCount, config.itemType)
+            logger.info { "Recovered $recoveredCount stale claims for itemType=${config.itemType}" }
         }
         return recoveredCount
     }
@@ -121,7 +118,7 @@ class DispatcherActivitiesImpl : DispatcherActivities {
         } catch (e: WorkflowNotFoundException) {
             false
         } catch (e: Exception) {
-            log.warnf("Error checking workflow %s existence: %s — assuming exists", workflowId, e.message)
+            logger.warn { "Error checking workflow $workflowId existence: ${e.message} — assuming exists" }
             true // Conservative: assume exists to avoid premature recovery
         }
     }
@@ -145,8 +142,7 @@ class DispatcherActivitiesImpl : DispatcherActivities {
         metrics.recordBatchClaimed(items.size)
 
         if (items.isNotEmpty()) {
-            log.infof("Claimed batch %s with %d items for itemType=%s",
-                batchId, items.size, config.itemType)
+            logger.info { "Claimed batch $batchId with ${items.size} items for itemType=${config.itemType}" }
         }
 
         return ClaimedBatch(batchId, config.itemType, items)
@@ -225,13 +221,13 @@ class DispatcherActivitiesImpl : DispatcherActivities {
         } catch (e: WorkflowExecutionAlreadyStarted) {
             // Temporal-level dedup: workflow already running — treat as success
             val workflowId = "exec-${itemType.lowercase()}-$itemId"
-            log.warnf("Exec workflow already running for itemId=%s (workflowId=%s)", itemId, workflowId)
+            logger.warn { "Exec workflow already running for itemId=$itemId (workflowId=$workflowId)" }
             queueRepo.markDispatched(itemId, workflowId)
             DispatchResult(itemId, success = true, alreadyRunning = true, workflowId = workflowId)
 
         } catch (e: Exception) {
             // Dispatch failed — reset to READY for retry in next cycle
-            log.errorf(e, "Failed to dispatch itemId=%s", itemId)
+            logger.error(e) { "Failed to dispatch itemId=$itemId" }
             queueRepo.resetToReady(itemId, e.message)
 
             auditRepo.log(
@@ -265,8 +261,7 @@ class DispatcherActivitiesImpl : DispatcherActivities {
             durationMs = 0 // Duration tracking is at workflow level via metrics
         )
 
-        log.infof("Batch %s complete: %d dispatched, %d failed (itemType=%s)",
-            batchId, successCount, failCount, config.itemType)
+        logger.info { "Batch $batchId complete: $successCount dispatched, $failCount failed (itemType=${config.itemType})" }
     }
 
 }

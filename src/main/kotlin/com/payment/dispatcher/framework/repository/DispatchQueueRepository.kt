@@ -18,7 +18,7 @@ import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
-import org.jboss.logging.Logger
+import io.github.oshai.kotlinlogging.KotlinLogging
 import java.sql.Timestamp
 import java.time.Instant
 
@@ -28,15 +28,13 @@ import java.time.Instant
  * since Exposed DSL only provides PostgreSQL-specific ForUpdateOption.
  * All other operations use Exposed DSL.
  */
+private val logger = KotlinLogging.logger {}
+
 @ApplicationScoped
 class DispatchQueueRepository {
 
     @Inject
     lateinit var dataSource: AgroalDataSource
-
-    companion object {
-        private val log = Logger.getLogger(DispatchQueueRepository::class.java)
-    }
 
     // ═══════════════════════════════════════════════════════════════════
     // Enqueue — Called by init workflows (Phase A)
@@ -201,7 +199,7 @@ class DispatchQueueRepository {
                 }
 
                 conn.commit()
-                log.debugf("Claimed %d items for batchId=%s (itemType=%s)", candidateIds.size, batchId, itemType)
+                logger.debug { "Claimed ${candidateIds.size} items for batchId=$batchId (itemType=$itemType)" }
             } catch (e: Exception) {
                 conn.rollback()
                 throw e
@@ -231,7 +229,7 @@ class DispatchQueueRepository {
             }
 
             if (updated == 0) {
-                log.warnf("markDispatched: no CLAIMED row found for itemId=%s (may already be DISPATCHED)", itemId)
+                logger.warn { "markDispatched: no CLAIMED row found for itemId=$itemId (may already be DISPATCHED)" }
             }
         }
     }
@@ -280,10 +278,7 @@ class DispatchQueueRepository {
             }
 
             if (isDeadLetter) {
-                log.warnf(
-                    "Item %s moved to DEAD_LETTER after %d retries: %s",
-                    itemId, newRetryCount, error?.take(200)
-                )
+                logger.warn { "Item $itemId moved to DEAD_LETTER after $newRetryCount retries: ${error?.take(200)}" }
             }
 
             isDeadLetter

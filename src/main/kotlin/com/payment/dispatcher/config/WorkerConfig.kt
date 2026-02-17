@@ -12,10 +12,10 @@ import io.temporal.client.WorkflowClient
 import io.temporal.worker.Worker
 import io.temporal.worker.WorkerFactory
 import io.temporal.worker.WorkerOptions
+import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.enterprise.event.Observes
 import jakarta.inject.Inject
-import org.jboss.logging.Logger
 
 /**
  * Manually creates and starts Temporal workers on application startup.
@@ -30,6 +30,8 @@ import org.jboss.logging.Logger
  * - **payment-init-worker** — runs Phase A (init workflow + context activities)
  * - **payment-exec-worker** — runs Phase B (exec workflow + exec activities)
  */
+private val logger = KotlinLogging.logger {}
+
 @ApplicationScoped
 class WorkerConfig {
 
@@ -52,10 +54,6 @@ class WorkerConfig {
     @Inject
     lateinit var paymentExecActivities: PaymentExecActivitiesImpl
 
-    companion object {
-        private val log = Logger.getLogger(WorkerConfig::class.java)
-    }
-
     fun onStart(@Observes event: StartupEvent) {
         val factory = WorkerFactory.newInstance(workflowClient)
 
@@ -64,7 +62,7 @@ class WorkerConfig {
         createPaymentExecWorker(factory)
 
         factory.start()
-        log.info("All Temporal workers started")
+        logger.info { "All Temporal workers started" }
     }
 
     private fun createDispatchWorker(factory: WorkerFactory) {
@@ -80,10 +78,7 @@ class WorkerConfig {
         worker.registerWorkflowImplementationTypes(DispatcherWorkflowImpl::class.java)
         worker.registerActivitiesImplementations(dispatcherActivities)
 
-        log.infof("Dispatch worker created: taskQueue=%s, maxWF=%d, maxAct=%d",
-            config.taskQueues().dispatcher(),
-            workerConfig.maxConcurrentWorkflows(),
-            workerConfig.maxConcurrentActivities())
+        logger.info { "Dispatch worker created: taskQueue=${config.taskQueues().dispatcher()}, maxWF=${workerConfig.maxConcurrentWorkflows()}, maxAct=${workerConfig.maxConcurrentActivities()}" }
     }
 
     private fun createPaymentInitWorker(factory: WorkerFactory) {
@@ -99,10 +94,7 @@ class WorkerConfig {
         worker.registerWorkflowImplementationTypes(PaymentInitWorkflowImpl::class.java)
         worker.registerActivitiesImplementations(paymentInitActivities, paymentContextActivities)
 
-        log.infof("Payment init worker created: taskQueue=%s, maxWF=%d, maxAct=%d",
-            config.taskQueues().paymentInit(),
-            workerConfig.maxConcurrentWorkflows(),
-            workerConfig.maxConcurrentActivities())
+        logger.info { "Payment init worker created: taskQueue=${config.taskQueues().paymentInit()}, maxWF=${workerConfig.maxConcurrentWorkflows()}, maxAct=${workerConfig.maxConcurrentActivities()}" }
     }
 
     private fun createPaymentExecWorker(factory: WorkerFactory) {
@@ -118,9 +110,6 @@ class WorkerConfig {
         worker.registerWorkflowImplementationTypes(PaymentExecWorkflowImpl::class.java)
         worker.registerActivitiesImplementations(paymentExecActivities)
 
-        log.infof("Payment exec worker created: taskQueue=%s, maxWF=%d, maxAct=%d",
-            config.taskQueues().paymentExec(),
-            workerConfig.maxConcurrentWorkflows(),
-            workerConfig.maxConcurrentActivities())
+        logger.info { "Payment exec worker created: taskQueue=${config.taskQueues().paymentExec()}, maxWF=${workerConfig.maxConcurrentWorkflows()}, maxAct=${workerConfig.maxConcurrentActivities()}" }
     }
 }

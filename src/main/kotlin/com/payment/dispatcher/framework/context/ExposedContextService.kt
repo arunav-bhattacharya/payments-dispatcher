@@ -9,7 +9,7 @@ import org.jetbrains.exposed.sql.insert
 import org.jetbrains.exposed.sql.selectAll
 import org.jetbrains.exposed.sql.transactions.transaction
 import org.jetbrains.exposed.sql.update
-import org.jboss.logging.Logger
+import io.github.oshai.kotlinlogging.KotlinLogging
 import java.time.Instant
 
 /**
@@ -22,12 +22,13 @@ import java.time.Instant
  * Uses insert-first strategy: attempts INSERT, falls back to UPDATE on duplicate key.
  * This avoids Oracle MERGE overhead from Exposed's upsert().
  */
+private val logger = KotlinLogging.logger {}
+
 open class ExposedContextService<T>(
     private val objectMapper: ObjectMapper
 ) : ExecutionContextService<T> {
 
     companion object {
-        private val log = Logger.getLogger(ExposedContextService::class.java)
         // Oracle unique constraint violation: ORA-00001
         private const val ORACLE_UNIQUE_VIOLATION = 1
     }
@@ -55,7 +56,7 @@ open class ExposedContextService<T>(
                 val isUniqueViolation = e.sqlState == "23000" ||
                     (e.cause as? java.sql.SQLException)?.errorCode == ORACLE_UNIQUE_VIOLATION
                 if (isUniqueViolation) {
-                    log.debugf("Context already exists for itemId=%s — updating", itemId)
+                    logger.debug { "Context already exists for itemId=$itemId — updating" }
                     ExecContextTable.update({ ExecContextTable.paymentId eq itemId }) {
                         it[contextJson] = json
                         it[contextVersion] = 1
@@ -67,8 +68,7 @@ open class ExposedContextService<T>(
             }
         }
 
-        log.debugf("Saved context for itemId=%s (type=%s, size=%d bytes)",
-            itemId, itemType, json.length)
+        logger.debug { "Saved context for itemId=$itemId (type=$itemType, size=${json.length} bytes)" }
     }
 
     /**
@@ -94,7 +94,7 @@ open class ExposedContextService<T>(
         transaction {
             ExecContextTable.deleteWhere { paymentId eq itemId }
         }
-        log.debugf("Deleted context for itemId=%s", itemId)
+        logger.debug { "Deleted context for itemId=$itemId" }
     }
 
     /**

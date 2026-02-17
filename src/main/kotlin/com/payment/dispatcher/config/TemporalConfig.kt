@@ -4,11 +4,11 @@ import io.temporal.client.WorkflowClient
 import io.temporal.client.WorkflowClientOptions
 import io.temporal.serviceclient.WorkflowServiceStubs
 import io.temporal.serviceclient.WorkflowServiceStubsOptions
+import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.enterprise.inject.Produces
 import jakarta.inject.Inject
 import jakarta.inject.Singleton
-import org.jboss.logging.Logger
 
 /**
  * CDI producer for Temporal client infrastructure.
@@ -18,21 +18,19 @@ import org.jboss.logging.Logger
  *
  * Replaces the Quarkiverse Temporal extension's auto-configuration.
  */
+private val logger = KotlinLogging.logger {}
+
 @ApplicationScoped
 class TemporalConfig {
 
     @Inject
     lateinit var config: AppConfig
 
-    companion object {
-        private val log = Logger.getLogger(TemporalConfig::class.java)
-    }
-
     @Produces
     @Singleton
     fun workflowServiceStubs(): WorkflowServiceStubs {
         val target = config.temporal().target()
-        log.infof("Connecting to Temporal server at %s", target)
+        logger.info { "Connecting to Temporal server at $target" }
 
         return WorkflowServiceStubs.newServiceStubs(
             WorkflowServiceStubsOptions.newBuilder()
@@ -45,7 +43,7 @@ class TemporalConfig {
     @Singleton
     fun workflowClient(serviceStubs: WorkflowServiceStubs): WorkflowClient {
         val namespace = config.temporal().namespace()
-        log.infof("Creating Temporal WorkflowClient for namespace=%s", namespace)
+        logger.info { "Creating Temporal WorkflowClient for namespace=$namespace" }
 
         return WorkflowClient.newInstance(
             serviceStubs,

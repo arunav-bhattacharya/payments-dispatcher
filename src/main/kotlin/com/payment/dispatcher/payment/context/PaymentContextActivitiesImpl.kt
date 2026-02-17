@@ -5,9 +5,9 @@ import com.payment.dispatcher.framework.activity.SchedulableContextActivities
 import com.payment.dispatcher.framework.context.ExposedContextService
 import com.payment.dispatcher.framework.repository.DispatchQueueRepository
 import com.payment.dispatcher.payment.model.PaymentExecContext
+import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
-import org.jboss.logging.Logger
 import java.time.Instant
 
 /**
@@ -21,6 +21,8 @@ import java.time.Instant
  * would create InvoiceContextActivitiesImpl implementing the same
  * [SchedulableContextActivities] interface with InvoiceExecContext.
  */
+private val logger = KotlinLogging.logger {}
+
 @ApplicationScoped
 class PaymentContextActivitiesImpl : SchedulableContextActivities {
 
@@ -33,10 +35,6 @@ class PaymentContextActivitiesImpl : SchedulableContextActivities {
     /** Lazy-initialized context service parameterized with PaymentExecContext */
     private val contextService by lazy {
         ExposedContextService<PaymentExecContext>(objectMapper)
-    }
-
-    companion object {
-        private val log = Logger.getLogger(PaymentContextActivitiesImpl::class.java)
     }
 
     override fun saveContextAndEnqueue(
@@ -58,7 +56,6 @@ class PaymentContextActivitiesImpl : SchedulableContextActivities {
             initWorkflowId = initWorkflowId
         )
 
-        log.infof("Payment %s: context saved and enqueued for execution at %s",
-            context.paymentId, scheduledExecTime)
+        logger.info { "Payment ${context.paymentId}: context saved and enqueued for execution at $scheduledExecTime" }
     }
 }

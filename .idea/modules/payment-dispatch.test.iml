@@ -67,6 +67,7 @@
     <orderEntry type="library" name="Gradle: org.jetbrains.exposed:exposed-core:0.61.0" level="project" />
     <orderEntry type="library" name="Gradle: com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.20.1" level="project" />
     <orderEntry type="library" name="Gradle: com.fasterxml.jackson.module:jackson-module-kotlin:2.20.1" level="project" />
+    <orderEntry type="library" name="Gradle: io.github.oshai:kotlin-logging-jvm:7.0.3" level="project" />
     <orderEntry type="library" name="Gradle: org.jetbrains.kotlin:kotlin-stdlib:2.2.21" level="project" />
     <orderEntry type="library" name="Gradle: io.quarkus:quarkus-junit5:3.29.4" level="project" />
     <orderEntry type="library" name="Gradle: org.jetbrains.kotlin:kotlin-reflect:2.2.21" level="project" />

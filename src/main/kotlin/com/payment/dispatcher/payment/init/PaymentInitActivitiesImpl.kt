@@ -7,9 +7,9 @@ import com.payment.dispatcher.payment.model.PaymentExecContext
 import com.payment.dispatcher.payment.model.PaymentRequest
 import com.payment.dispatcher.payment.model.RoutingDetails
 import com.payment.dispatcher.payment.model.ValidationResult
+import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
-import org.jboss.logging.Logger
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalTime
@@ -21,6 +21,8 @@ import java.time.ZonedDateTime
  * These are TODO stubs — replace with actual business logic that calls Oracle DB,
  * external services, rules engines, etc.
  */
+private val logger = KotlinLogging.logger {}
+
 @ApplicationScoped
 class PaymentInitActivitiesImpl : PaymentInitActivities {
 
@@ -28,12 +30,11 @@ class PaymentInitActivitiesImpl : PaymentInitActivities {
     lateinit var objectMapper: ObjectMapper
 
     companion object {
-        private val log = Logger.getLogger(PaymentInitActivitiesImpl::class.java)
         private val MST_ZONE = ZoneId.of("America/Denver")
     }
 
     override fun validatePayment(paymentId: String, requestJson: String): String {
-        log.debugf("Validating payment %s", paymentId)
+        logger.debug { "Validating payment $paymentId" }
         // TODO: Validate against Oracle DB — account exists, sufficient funds,
         //       sanctions screening, duplicate check, etc.
         val result = ValidationResult(
@@ -45,7 +46,7 @@ class PaymentInitActivitiesImpl : PaymentInitActivities {
     }
 
     override fun enrichPayment(paymentId: String, requestJson: String): String {
-        log.debugf("Enriching payment %s", paymentId)
+        logger.debug { "Enriching payment $paymentId" }
         // TODO: Enrich with account holder names, routing details,
         //       correspondent bank info, metadata from external services
         val result = EnrichmentData(
@@ -62,7 +63,7 @@ class PaymentInitActivitiesImpl : PaymentInitActivities {
     }
 
     override fun applyRules(paymentId: String, requestJson: String): String {
-        log.debugf("Applying rules for payment %s", paymentId)
+        logger.debug { "Applying rules for payment $paymentId" }
         // TODO: Run through business rules engine — compliance flags,
         //       approval requirements, routing rules, etc.
         val result = listOf(
@@ -77,7 +78,7 @@ class PaymentInitActivitiesImpl : PaymentInitActivities {
     }
 
     override fun persistScheduledPayment(paymentId: String, requestJson: String): String {
-        log.infof("Persisting payment %s with SCHEDULED status", paymentId)
+        logger.info { "Persisting payment $paymentId with SCHEDULED status" }
         // TODO: Persist the payment record in the payments database with SCHEDULED status.
         // This is the first durable business state — the payment is now visible in the system.
         //
@@ -88,7 +89,7 @@ class PaymentInitActivitiesImpl : PaymentInitActivities {
         // The payment status lifecycle is:
         //   SCHEDULED → ACCEPTED → PROCESSING
 
-        log.infof("Payment %s persisted with status SCHEDULED", paymentId)
+        logger.info { "Payment $paymentId persisted with status SCHEDULED" }
         return paymentId
     }
 

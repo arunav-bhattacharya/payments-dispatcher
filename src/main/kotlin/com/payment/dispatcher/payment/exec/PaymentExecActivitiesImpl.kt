@@ -2,8 +2,8 @@ package com.payment.dispatcher.payment.exec
 
 import com.payment.dispatcher.payment.model.PaymentExecContext
 import com.payment.dispatcher.payment.model.PaymentStatus
+import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.enterprise.context.ApplicationScoped
-import org.jboss.logging.Logger
 
 /**
  * Phase B execution activity implementations.
@@ -13,20 +13,13 @@ import org.jboss.logging.Logger
  *   SCHEDULED → ACCEPTED (after validation in post-schedule flow)
  *   ACCEPTED  → PROCESSING (after notifications sent to all parties)
  */
+private val logger = KotlinLogging.logger {}
+
 @ApplicationScoped
 class PaymentExecActivitiesImpl : PaymentExecActivities {
 
-    companion object {
-        private val log = Logger.getLogger(PaymentExecActivitiesImpl::class.java)
-    }
-
     override fun executePayment(context: PaymentExecContext) {
-        log.infof("Executing payment %s: %s %s from %s to %s",
-            context.paymentId,
-            context.amount,
-            context.currency,
-            context.sourceAccount,
-            context.destinationAccount)
+        logger.info { "Executing payment ${context.paymentId}: ${context.amount} ${context.currency} from ${context.sourceAccount} to ${context.destinationAccount}" }
 
         // TODO: Validate payment in the post-schedule flow
         // - Re-confirm account state, funds availability at execution time
@@ -34,8 +27,7 @@ class PaymentExecActivitiesImpl : PaymentExecActivities {
         //
         // On successful validation, transition payment status:
         //   UPDATE PAYMENTS SET status = 'ACCEPTED' WHERE payment_id = ? AND status = 'SCHEDULED'
-        log.infof("Payment %s validated and status transitioned to %s",
-            context.paymentId, PaymentStatus.ACCEPTED)
+        logger.info { "Payment ${context.paymentId} validated and status transitioned to ${PaymentStatus.ACCEPTED}" }
 
         // TODO: Execute the actual payment against external payment rails
         // - Debit source account
@@ -47,11 +39,11 @@ class PaymentExecActivitiesImpl : PaymentExecActivities {
         // context.appliedRules, context.fxRateSnapshot as needed — all Phase A work
         // is already done and available in the context.
 
-        log.infof("Payment %s executed successfully", context.paymentId)
+        logger.info { "Payment ${context.paymentId} executed successfully" }
     }
 
     override fun postProcess(context: PaymentExecContext) {
-        log.debugf("Post-processing payment %s", context.paymentId)
+        logger.debug { "Post-processing payment ${context.paymentId}" }
 
         // TODO: Post-processing tasks
         // - Update ledger entries
@@ -61,7 +53,7 @@ class PaymentExecActivitiesImpl : PaymentExecActivities {
     }
 
     override fun sendNotifications(context: PaymentExecContext) {
-        log.debugf("Sending notifications for payment %s", context.paymentId)
+        logger.debug { "Sending notifications for payment ${context.paymentId}" }
 
         // TODO: Send notifications
         // - Email to payer/payee
@@ -71,7 +63,6 @@ class PaymentExecActivitiesImpl : PaymentExecActivities {
         //
         // After all parties are notified, transition payment status:
         //   UPDATE PAYMENTS SET status = 'PROCESSING' WHERE payment_id = ? AND status = 'ACCEPTED'
-        log.infof("Payment %s: all parties notified, status transitioned to %s",
-            context.paymentId, PaymentStatus.PROCESSING)
+        logger.info { "Payment ${context.paymentId}: all parties notified, status transitioned to ${PaymentStatus.PROCESSING}" }
     }
 }

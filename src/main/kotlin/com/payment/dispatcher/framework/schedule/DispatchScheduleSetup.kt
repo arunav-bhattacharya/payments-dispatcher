@@ -1,5 +1,6 @@
 package com.payment.dispatcher.framework.schedule
 
+import com.payment.dispatcher.framework.workflow.DispatcherWorkflow
 import io.temporal.client.WorkflowClient
 import io.temporal.client.schedules.Schedule
 import io.temporal.client.schedules.ScheduleActionStartWorkflow
@@ -10,9 +11,9 @@ import io.temporal.client.schedules.SchedulePolicy
 import io.temporal.client.schedules.ScheduleSpec
 import io.temporal.api.enums.v1.ScheduleOverlapPolicy
 import io.temporal.serviceclient.WorkflowServiceStubs
+import io.github.oshai.kotlinlogging.KotlinLogging
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
-import org.jboss.logging.Logger
 import java.time.Duration
 
 /**
@@ -22,6 +23,8 @@ import java.time.Duration
  * The schedule fires DispatcherWorkflow at a configurable interval
  * with OverlapPolicy.SKIP to prevent concurrent dispatchers.
  */
+private val logger = KotlinLogging.logger {}
+
 @ApplicationScoped
 class DispatchScheduleSetup {
 
@@ -30,10 +33,6 @@ class DispatchScheduleSetup {
 
     @Inject
     lateinit var workflowServiceStubs: WorkflowServiceStubs
-
-    companion object {
-        private val log = Logger.getLogger(DispatchScheduleSetup::class.java)
-    }
 
     /**
      * Creates a Temporal Schedule for the dispatcher.
@@ -56,7 +55,7 @@ class DispatchScheduleSetup {
             val schedule = Schedule.newBuilder()
                 .setAction(
                     ScheduleActionStartWorkflow.newBuilder()
-                        .setWorkflowType("DispatcherWorkflow")
+                        .setWorkflowType(DispatcherWorkflow::class.java)
                         .setArguments(itemType)
                         .setOptions(
                             io.temporal.client.WorkflowOptions.newBuilder()
@@ -86,18 +85,17 @@ class DispatchScheduleSetup {
                 ScheduleOptions.newBuilder().build()
             )
 
-            log.infof("Created dispatch schedule '%s' for itemType=%s (interval=%ds, taskQueue=%s)",
-                scheduleId, itemType, intervalSecs, taskQueue)
+            logger.info { "Created dispatch schedule '$scheduleId' for itemType=$itemType (interval=${intervalSecs}s, taskQueue=$taskQueue)" }
 
         } catch (e: io.grpc.StatusRuntimeException) {
             // Schedule already exists — ALREADY_EXISTS status code
             if (e.status.code == io.grpc.Status.Code.ALREADY_EXISTS) {
-                log.infof("Dispatch schedule '%s' already exists — skipping creation", scheduleId)
+                logger.info { "Dispatch schedule '$scheduleId' already exists — skipping creation" }
             } else {
-                log.warnf("Failed to create dispatch schedule '%s': %s", scheduleId, e.message)
+                logger.warn { "Failed to create dispatch schedule '$scheduleId': ${e.message}" }
             }
         } catch (e: Exception) {
-            log.warnf("Failed to create dispatch schedule '%s': %s", scheduleId, e.message)
+            logger.warn { "Failed to create dispatch schedule '$scheduleId': ${e.message}" }
             // Non-fatal: schedule may already exist from a previous deployment
         }
     }

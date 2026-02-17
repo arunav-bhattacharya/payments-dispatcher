@@ -11,6 +11,7 @@ repositories {
 val quarkusPlatformVersion: String by project
 val temporalSdkVersion: String by project
 val exposedVersion: String by project
+val kotlinLoggingVersion: String by project
 
 dependencies {
     // Quarkus BOM
@@ -37,6 +38,9 @@ dependencies {
     // Jackson Kotlin module for JSON CLOB serialization
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin")
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310")
+
+    // Logging — kotlin-logging facade over SLF4J (Quarkus provides the SLF4J backend)
+    implementation("io.github.oshai:kotlin-logging-jvm:$kotlinLoggingVersion")
 
     // Micrometer + Prometheus for metrics
     implementation("io.quarkus:quarkus-micrometer-registry-prometheus")
