@@ -1,4 +1,4 @@
-# Rate-Limited Payment Dispatch System
+# Rate-Limited Payments Dispatcher System
 
 A two-phase, rate-limited payment processing system built on **Quarkus**, **Temporal**, and **Oracle**. Designed to handle 500K–1M+ daily payments that converge on a single execution window (e.g., 16:00 MST) without overwhelming the Temporal Postgres database.
 
