@@ -16,9 +16,9 @@ import java.time.Duration
  * and executes the payment business logic — nothing more.
  *
  * The dispatch framework (DispatcherActivitiesImpl) starts this workflow
- * and manages queue status transitions externally. Stale recovery
- * handles any orphaned CLAIMED items if the dispatcher crashes
- * between claiming and starting the workflow.
+ * and manages queue status transitions externally. If the dispatcher
+ * crashes between claiming and starting, the unified claim query
+ * automatically picks up stale CLAIMED items in the next cycle.
  */
 class PaymentExecWorkflowImpl : PaymentExecWorkflow {
 

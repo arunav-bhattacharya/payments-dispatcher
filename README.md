@@ -350,12 +350,9 @@ stateDiagram-v2
     PersistingPayment --> BuildingContext : Payment persisted (SCHEDULED)
     PersistingPayment --> Failed_Init : Persist error
 
-    BuildingContext --> SavingContext : Context assembled
-    SavingContext --> Enqueueing : Context saved to CLOB
-    SavingContext --> Failed_Init : Save failed (no enqueue)
-
-    Enqueueing --> Completed_A : Enqueued (READY)
-    Enqueueing --> OrphanedContext : Enqueue failed\n(context exists, harmless)
+    BuildingContext --> SavingAndEnqueueing : Context assembled
+    SavingAndEnqueueing --> Completed_A : Context saved + enqueued (READY)
+    SavingAndEnqueueing --> Failed_Init : Save failed
 
     Completed_A --> [*] : Workflow completes immediately
 
@@ -365,12 +362,12 @@ stateDiagram-v2
         First durable business state.
     end note
 
-    note right of SavingContext
-        Order matters:
-        1. Save context FIRST
-        2. Then enqueue
-        If save fails → nothing enqueued (safe)
-        If enqueue fails → orphaned context (TTL cleanup)
+    note right of SavingAndEnqueueing
+        Single Temporal activity:
+        1. Save context (insert-first, idempotent)
+        2. Enqueue (READY)
+        Temporal retries the entire activity
+        on failure — enqueue cannot permanently fail.
     end note
 
     note right of Completed_A

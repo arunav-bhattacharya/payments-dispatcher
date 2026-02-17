@@ -115,7 +115,7 @@ PaymentExecWorkflowImpl (zero framework awareness)
 └── execActivities.sendNotifications(context)
 ```
 
-The exec workflow has no dispatch framework imports. The dispatcher manages queue status externally. Stale recovery handles orphaned CLAIMED items.
+The exec workflow has no dispatch framework imports. The dispatcher manages queue status externally. The unified claim query automatically picks up stale CLAIMED items if the dispatcher crashes.
 
 ### Changes Made
 

@@ -19,9 +19,9 @@ interface SchedulableContextActivities {
     /**
      * Saves execution context to the persistence store and enqueues the item for dispatch.
      *
-     * Order matters: saves context FIRST, then enqueues.
-     * - If enqueue fails, orphaned context is harmless (TTL cleanup).
-     * - If context save fails, nothing is enqueued — safe failure mode.
+     * Order matters: saves context FIRST (idempotent via insert-first), then enqueues.
+     * Since this is a single Temporal activity, failures are automatically retried —
+     * the enqueue step cannot permanently fail.
      *
      * @param itemType          The item type discriminator (e.g., "PAYMENT", "INVOICE")
      * @param contextJson       Full execution context serialized as JSON string

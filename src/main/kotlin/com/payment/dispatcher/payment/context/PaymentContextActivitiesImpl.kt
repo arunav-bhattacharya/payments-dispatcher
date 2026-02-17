@@ -45,7 +45,7 @@ class PaymentContextActivitiesImpl : SchedulableContextActivities {
     ) {
         val context = objectMapper.readValue(contextJson, PaymentExecContext::class.java)
 
-        // Save context FIRST — if enqueue fails, orphaned context is harmless
+        // Save context FIRST (idempotent via insert-first) — Temporal retries the whole activity on failure
         contextService.save(context.paymentId, itemType, context)
 
         // Then enqueue for dispatch
