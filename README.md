@@ -10,45 +10,15 @@ When hundreds of thousands of payments are scheduled for the same execution time
 
 Split the single long-lived workflow into **two short-lived workflows** connected by an **Oracle-based dispatch queue**:
 
-- **Phase A** — Validate, enrich, apply rules, persist payment as SCHEDULED, save context, enqueue, and **complete immediately** (no sleep).
-- **Phase B** — A Temporal Schedule fires a dispatcher every N seconds. The dispatcher claims batches from Oracle using `FOR UPDATE SKIP LOCKED`, then starts execution workflows with `startDelay()` jitter.
+- **Phase A (Init)** — Validate, enrich, apply rules, persist payment as `SCHEDULED`, save context as JSON CLOB, enqueue as `READY`, and **complete immediately** (no sleep).
+- **Oracle Queue** — Payments sit in `READY` until their scheduled execution time. The batch claim query pre-loads the Phase A context via JOIN, so exec workflows have zero Oracle dependency.
+- **Phase B (Dispatch + Exec)** — A Temporal Schedule fires a dispatcher every 5 seconds. The dispatcher claims batches from Oracle using `FOR UPDATE SKIP LOCKED`, then starts exec workflows with `startDelay()` jitter, passing the pre-loaded `contextJson` as a parameter. Exec workflows are pure business logic with zero framework awareness.
 
 This reduces Temporal DB pressure by **~200x** (from 500K sleeping workflows to ~500 concurrent short-lived ones).
 
 ---
 
 ## Architecture
-
-**Phase A (Payment Initialization)**
-
-- Validates, enriches, and applies rules to the payment
-- Persists the payment in the payments DB with `SCHEDULED` status
-- Serializes all accumulated results as a JSON CLOB context
-- Enqueues the payment in the dispatch queue with `READY` status
-- Workflow completes immediately — no sleeping workflows
-
-**Oracle Dispatch Queue**
-
-- Buffer between phases — payments sit in `READY` until their scheduled execution time
-- Concurrent dispatchers via `FOR UPDATE SKIP LOCKED`
-- Built-in retry tracking for dispatch failures (CLAIMED → READY)
-- Unified stale recovery — claim query picks up stale CLAIMED items alongside READY items
-- Stores Phase A context as JSON CLOB (no work repeated in Phase B)
-- Queue lifecycle ends at DISPATCHED — Temporal manages execution from that point
-
-**Phase B (Dispatch & Execution)**
-
-- Temporal Schedule fires `DispatcherWorkflow` every 5 seconds
-- Each cycle: read config (kill switch) → claim batch (includes stale recovery) → dispatch → record results
-- Batch claim JOINs with context table to **pre-load JSON CLOB** — no separate Oracle round-trip per execution
-- Exec workflows started with `startDelay()` jitter to prevent thundering herd
-- Exec workflows are pure business logic with zero dispatch framework awareness — they receive `contextJson` as a parameter, deserialize it, and execute. The dispatcher manages queue status externally
-- Payment transitions: `SCHEDULED` → `ACCEPTED` → `PROCESSING`
-
-**Observability**
-
-- Insert-only audit log in Oracle (dispatches, failures)
-- Prometheus metrics via Micrometer (batch claimed, workflow starts, failures, cycle duration)
 
 ```mermaid
 graph TB
@@ -59,13 +29,12 @@ graph TB
         ENRICH --> RULES["Apply Rules"]
         RULES --> PERSIST["Persist SCHEDULED Payment"]
         PERSIST --> BUILD_CTX["Build Context"]
-        BUILD_CTX --> SAVE_CTX["Save Context (CLOB)"]
-        SAVE_CTX -->|"ScheduleLifecycle"| ENQUEUE["Enqueue (READY)"]
-        ENQUEUE --> COMPLETE_A["Workflow Completes"]
+        BUILD_CTX --> SAVE_CTX["Save Context (CLOB)\n+ Enqueue (READY)"]
+        SAVE_CTX --> COMPLETE_A["Workflow Completes"]
     end
 
     subgraph "Oracle Dispatch Queue"
-        ENQUEUE --> ORACLE_Q[("PAYMENT_EXEC_QUEUE\n(status: READY)")]
+        SAVE_CTX --> ORACLE_Q[("PAYMENT_EXEC_QUEUE\n(status: READY)")]
         SAVE_CTX --> ORACLE_CTX[("PAYMENT_EXEC_CONTEXT\n(JSON CLOB)")]
     end
 
@@ -95,7 +64,9 @@ graph TB
 
 ---
 
-## Payment Lifecycle — End-to-End Sequence Diagram
+## End-to-End Lifecycle
+
+This diagram shows the full flow from payment arrival through execution, including both the payment business status and the queue infrastructure status.
 
 ```mermaid
 sequenceDiagram
@@ -117,14 +88,13 @@ sequenceDiagram
     IW->>IA: persistScheduledPayment
     IA->>PDB: INSERT payment (status = SCHEDULED)
     IW->>IA: buildContext + determineExecTime
-    IW->>IW: ScheduleLifecycle.schedule(contextJson, execTime)
     IW->>CA: saveContextAndEnqueue(itemType, contextJson, execTime, workflowId)
     CA->>Oracle: INSERT context CLOB + INSERT queue (READY)
     Note over IW: Workflow completes immediately
     end
 
     rect rgb(255, 245, 235)
-    Note over T: Dispatcher (every 5s) — claims batch + pre-loads context
+    Note over T: Dispatcher (every 5s) — claims READY + stale CLAIMED, pre-loads context
     T->>Oracle: claimBatch (FOR UPDATE SKIP LOCKED + JOIN context)
     Oracle-->>T: ClaimedBatch (items + contextJson)
     T->>T: dispatchBatch: WorkflowClient.start(id, contextJson, startDelay=jitter)
@@ -145,11 +115,21 @@ sequenceDiagram
     end
 ```
 
+### Status Lifecycles
+
+**Queue status** (infrastructure-level, managed by dispatcher):
+
+`READY` → `CLAIMED` → `DISPATCHED` (terminal — Temporal owns it from here)
+
+**Payment status** (business-level, managed by exec workflow):
+
+`SCHEDULED` → `ACCEPTED` → `PROCESSING`
+
 ---
 
-## Dispatch Cycle — Sequence Diagram
+## Dispatch Cycle
 
-The dispatcher workflow runs as a short-lived Temporal workflow triggered by a schedule every 5 seconds. Each cycle is a self-contained unit of work: read config, claim a batch (which also picks up stale CLAIMED items), dispatch, and record results. If any step fails, the entire cycle fails gracefully and the next scheduled cycle picks up the work.
+The dispatcher workflow runs as a short-lived Temporal workflow triggered by a schedule every 5 seconds. Each cycle is a self-contained unit of work. If any step fails, the entire cycle fails gracefully and the next scheduled cycle picks up the work.
 
 ```mermaid
 sequenceDiagram
@@ -185,7 +165,7 @@ sequenceDiagram
         DW-->>S: return (nothing to dispatch)
     end
 
-    Note over DW,DA: Step 3 — Dispatch Batch (context passed as param)
+    Note over DW,DA: Step 3 — Dispatch Batch
     DW->>DA: dispatchBatch(batch, config)
     loop For each item in batch
         DA->>DA: jitterDelay = random(0, 4000ms)
@@ -216,208 +196,42 @@ sequenceDiagram
 
 ---
 
-## Payment Status — State Diagram
+## Reliability Guarantees
 
-The payment has its own business-level status lifecycle, tracked in the payments database. This is separate from the dispatch queue status and represents the payment's progress through the business process.
+### Deduplication — No Payment Executed Twice
 
-```mermaid
-stateDiagram-v2
-    [*] --> SCHEDULED : Phase A persists payment\n(after validate, enrich, apply rules)
+Four independent layers prevent duplicate execution:
 
-    SCHEDULED --> ACCEPTED : Phase B validates in\npost-schedule flow\n(executePayment)
+| Layer | Mechanism | What It Prevents |
+|-------|-----------|------------------|
+| **Schedule SKIP** | `ScheduleOverlapPolicy.SKIP` | Two dispatcher workflows running at the same time. The Temporal Schedule will not fire a new dispatcher cycle if the previous one is still running. |
+| **Oracle SKIP LOCKED** | `SELECT ... FOR UPDATE SKIP LOCKED` | Two dispatcher instances claiming the same row. Each dispatcher transaction locks its own disjoint set of rows; any rows already locked by another transaction are silently skipped. |
+| **Deterministic Workflow ID** | `exec-{itemType}-{itemId}` | Two exec workflows for the same payment. Temporal enforces workflow ID uniqueness — attempting to start a workflow with an already-running ID throws `WorkflowExecutionAlreadyStarted`, which the dispatcher catches and treats as success. |
+| **Status Guards** | `WHERE queue_status = 'CLAIMED'` | Out-of-order status transitions. Every `UPDATE` that changes queue status includes a `WHERE` clause asserting the expected current status. For example, `markDispatched()` requires `queue_status = 'CLAIMED'` — if another dispatcher already moved the row to `DISPATCHED`, the UPDATE affects zero rows and the dispatcher logs a warning. This prevents a slow dispatcher from overwriting a status that has already advanced. |
 
-    ACCEPTED --> PROCESSING : All parties notified\n(sendNotifications)
+### Completeness — No Payment Left Behind
 
-    PROCESSING --> [*]
+Every payment that enters the system is guaranteed to eventually reach `DISPATCHED` (at which point Temporal owns the execution lifecycle):
 
-    note right of SCHEDULED
-        Payment is persisted in the
-        payments DB. Waiting for its
-        scheduled execution time.
-        Context saved as CLOB.
-        Enqueued in dispatch queue.
-    end note
+- **Enqueue is retried by Temporal.** The `saveContextAndEnqueue` method is a single Temporal activity. If the enqueue step fails (e.g., Oracle is momentarily down), Temporal automatically retries the entire activity. Context save is idempotent (insert-first with duplicate-key fallback), so retries are safe. A payment cannot be "lost" before entering the queue.
 
-    note right of ACCEPTED
-        Post-schedule validation passed.
-        Payment execution (debit/credit/
-        settlement) completed.
-        Confirmed ready for processing.
-    end note
+- **READY items are picked up by the next cycle.** The dispatcher runs every 5 seconds. Any `READY` item whose `scheduled_exec_time` has arrived and whose `retry_count < max_dispatch_retries` will be claimed. Items are never skipped as long as the dispatcher is running and the kill switch is not active.
 
-    note right of PROCESSING
-        All parties (payer, payee,
-        integration partners) have
-        been notified. Terminal
-        business state.
-    end note
-```
+- **Stale CLAIMED items self-heal.** If the dispatcher JVM crashes after claiming a batch but before dispatching, those items are stuck in `CLAIMED`. The unified claim query includes an OR predicate that picks up `CLAIMED` rows whose `claimed_at` exceeds the configured threshold (default: 2 minutes). These stale items are re-claimed and re-dispatched in a subsequent cycle — no manual intervention required.
 
----
+- **Failed dispatches retry automatically.** If `WorkflowClient.start()` fails for a specific item (e.g., Temporal is temporarily unreachable), the item is immediately reset to `READY` with `retry_count++`. It will be picked up in the next cycle, up to `max_dispatch_retries` attempts.
 
-## Queue Status — State Diagram
+- **DISPATCHED is terminal for the queue.** Once an item reaches `DISPATCHED`, Temporal's built-in retry and timeout policies govern the exec workflow's lifecycle. The Oracle queue is no longer involved.
 
-The dispatch queue has its own infrastructure-level status lifecycle for managing the dispatch process. This is an internal mechanism and is separate from the payment's business status above. Once a workflow is successfully dispatched to Temporal, the queue row reaches its terminal state — Temporal manages the execution lifecycle from that point.
+### Failure Recovery
 
-```mermaid
-stateDiagram-v2
-    [*] --> READY : Phase A enqueues payment
-
-    READY --> CLAIMED : Dispatcher claims batch\n(FOR UPDATE SKIP LOCKED)
-
-    CLAIMED --> DISPATCHED : Exec workflow started\n(WorkflowClient.start)
-    CLAIMED --> READY : Dispatch failed\n(retry_count++)
-    CLAIMED --> READY : Stale recovery\n(claimed_at > threshold,\nre-claimed in next batch)
-
-    DISPATCHED --> [*] : Terminal — Temporal\nowns the workflow now
-
-    note right of READY
-        Default initial state.
-        Eligible for next dispatch cycle.
-    end note
-
-    note right of CLAIMED
-        Locked by a dispatcher instance.
-        Re-claimed by unified batch query
-        if claimed_at exceeds threshold
-        (handles dispatcher crashes).
-    end note
-
-    note right of DISPATCHED
-        Terminal queue state. Exec workflow
-        confirmed running in Temporal.
-        Temporal manages execution lifecycle
-        (retries, timeouts, completion).
-        Deterministic workflow ID prevents
-        duplicate starts.
-    end note
-```
-
----
-
-## Combined Status Flow — Payment & Queue
-
-This diagram shows how the payment status and queue status flow together across both phases, from initial request through to completed processing. The queue lifecycle ends at DISPATCHED — once Temporal owns the workflow, queue status is no longer updated.
-
-```mermaid
-graph LR
-    subgraph "Phase A (Init Workflow)"
-        A1["Validate"] --> A2["Enrich"]
-        A2 --> A3["Apply Rules"]
-        A3 --> A4["Persist Payment\n(SCHEDULED)"]
-        A4 --> A5["Save Context\n+ Enqueue (READY)"]
-    end
-
-    subgraph "Dispatch Queue"
-        A5 --> Q1["READY"]
-        Q1 --> Q2["CLAIMED\n(context pre-loaded)"]
-        Q2 --> Q3["DISPATCHED\n(terminal queue state)"]
-    end
-
-    subgraph "Phase B (Exec Workflow — Temporal manages lifecycle)"
-        Q3 --> B1["Execute Payment\n(SCHEDULED → ACCEPTED)"]
-        B1 --> B2["Post-Process"]
-        B2 --> B3["Send Notifications\n(ACCEPTED → PROCESSING)"]
-    end
-
-    style A4 fill:#89b4fa,stroke:#1e66f5
-    style B1 fill:#a6e3a1,stroke:#40a02b
-    style B3 fill:#a6e3a1,stroke:#40a02b
-    style Q1 fill:#f9e2af,stroke:#e6a817
-    style Q2 fill:#f9e2af,stroke:#e6a817
-    style Q3 fill:#f9e2af,stroke:#e6a817
-```
-
----
-
-## Phase A — Payment Initialization State Diagram
-
-Phase A runs as a short-lived Temporal workflow. It validates, enriches, applies rules, persists the payment as `SCHEDULED`, builds the accumulated context, saves it to Oracle, and enqueues the payment for dispatch. The workflow completes immediately — no sleeping.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Validating : PaymentInitWorkflow started
-
-    Validating --> Enriching : Validation passed
-    Validating --> Failed_Init : Validation failed
-
-    Enriching --> ApplyingRules : Enrichment complete
-    Enriching --> Failed_Init : Enrichment error
-
-    ApplyingRules --> PersistingPayment : Rules applied
-    ApplyingRules --> Failed_Init : Rule rejection
-
-    PersistingPayment --> BuildingContext : Payment persisted (SCHEDULED)
-    PersistingPayment --> Failed_Init : Persist error
-
-    BuildingContext --> SavingAndEnqueueing : Context assembled
-    SavingAndEnqueueing --> Completed_A : Context saved + enqueued (READY)
-    SavingAndEnqueueing --> Failed_Init : Save failed
-
-    Completed_A --> [*] : Workflow completes immediately
-
-    note right of PersistingPayment
-        Payment is persisted in the
-        payments DB with SCHEDULED status.
-        First durable business state.
-    end note
-
-    note right of SavingAndEnqueueing
-        Single Temporal activity:
-        1. Save context (insert-first, idempotent)
-        2. Enqueue (READY)
-        Temporal retries the entire activity
-        on failure — enqueue cannot permanently fail.
-    end note
-
-    note right of Completed_A
-        No Workflow.sleep()
-        Payment waits in Oracle
-        READY status until
-        dispatcher picks it up
-    end note
-```
-
----
-
-## Deduplication Protection Layers
-
-The system implements four layers of duplicate dispatch prevention to ensure every payment is executed exactly once, even under concurrent dispatchers, network failures, and Temporal retries.
-
-```mermaid
-graph TB
-    subgraph "Layer 1 — Temporal Schedule"
-        L1["ScheduleOverlapPolicy.SKIP\nPrevents concurrent dispatcher cycles"]
-    end
-
-    subgraph "Layer 2 — Oracle Locking"
-        L2["FOR UPDATE SKIP LOCKED\nEach dispatcher claims disjoint batch\nNo two dispatchers claim same item"]
-    end
-
-    subgraph "Layer 3 — Deterministic Workflow ID"
-        L3["workflowId = exec-{type}-{itemId}\nTemporal rejects duplicate starts\n(WorkflowExecutionAlreadyStarted)"]
-    end
-
-    subgraph "Layer 4 — Status Guards"
-        L4["Queue status transitions are\nconditional (WHERE status = X)\nPrevents out-of-order transitions"]
-    end
-
-    L1 --> L2
-    L2 --> L3
-    L3 --> L4
-
-    style L1 fill:#89b4fa,stroke:#1e66f5
-    style L2 fill:#f9e2af,stroke:#e6a817
-    style L3 fill:#a6e3a1,stroke:#40a02b
-    style L4 fill:#f5c2e7,stroke:#ea76cb
-```
-
-| Layer | Mechanism | Prevents |
-|-------|-----------|----------|
-| **Schedule SKIP** | `ScheduleOverlapPolicy.SCHEDULE_OVERLAP_POLICY_SKIP` | Concurrent dispatcher workflows |
-| **SKIP LOCKED** | `SELECT ... FOR UPDATE SKIP LOCKED` | Two dispatchers claiming same row |
-| **Deterministic ID** | `exec-{itemType}-{itemId}` | Duplicate exec workflow starts |
-| **Status Guards** | `WHERE queue_status = 'CLAIMED'` | Out-of-order status transitions |
+| Failure Scenario | What Happens | Recovery |
+|-----------------|--------------|----------|
+| **Dispatcher crashes after claiming batch** | Items stuck in `CLAIMED` with stale `claimed_at` | Next cycle's unified claim query picks up `CLAIMED` rows older than threshold (default 2 min). Re-dispatched automatically. If the exec workflow was already started, `WorkflowExecutionAlreadyStarted` is caught and treated as success. |
+| **`WorkflowClient.start()` fails for an item** | Item cannot be dispatched to Temporal | Item immediately reset to `READY` with `retry_count++`. Retried in next cycle. |
+| **Exec workflow fails after DISPATCHED** | Business logic error during execution | Temporal manages retries, timeouts, and failure. Queue stays at `DISPATCHED` — no callback to Oracle needed. |
+| **Context pre-load fails during claimBatch** | The entire batch claim activity fails | Items remain `CLAIMED` → picked up as stale in the next cycle after threshold expires. |
+| **Oracle temporarily down** | Dispatcher activity fails | Temporal does not retry (maxAttempts=1). Next scheduled cycle (5s later) will attempt again. |
 
 ---
 
@@ -492,6 +306,69 @@ erDiagram
 | `idx_peq_stale_claims` | `(item_type, queue_status, claimed_at)` | Unified claim query — stale CLAIMED predicate |
 | `idx_peq_batch` | `(dispatch_batch_id)` | Post-claim batch lookup |
 
+### Unified Claim Query
+
+Raw JDBC is used because Kotlin Exposed DSL only provides `ForUpdateOption.PostgreSQL` — there is no Oracle-specific variant.
+
+```sql
+SELECT payment_id FROM PAYMENT_EXEC_QUEUE
+WHERE item_type = ?
+  AND (
+    (queue_status = 'READY' AND scheduled_exec_time <= ? AND retry_count < ?)
+    OR
+    (queue_status = 'CLAIMED' AND claimed_at <= ?)
+  )
+ORDER BY scheduled_exec_time ASC
+FETCH FIRST ? ROWS ONLY
+FOR UPDATE SKIP LOCKED
+```
+
+The OR predicate unifies normal dispatch (READY items) and stale recovery (old CLAIMED items) into a single Oracle round-trip.
+
+---
+
+## Key Design Decisions
+
+### `startDelay()` Instead of `Workflow.sleep()`
+
+```mermaid
+graph LR
+    subgraph "Before — Workflow.sleep()"
+        A1["500K Workflows Created"] --> A2["500K Sleeping\n(in Temporal DB)"] --> A3["All wake at 16:00\n(thundering herd)"]
+    end
+
+    subgraph "After — startDelay()"
+        B1["Dispatcher claims\n500 items/cycle"] --> B2["WorkflowClient.start()\nwith startDelay(jitter)"] --> B3["~500 workflows\nstaggered over\njitter window"]
+    end
+
+    style A2 fill:#f38ba8,stroke:#d20f39
+    style B3 fill:#a6e3a1,stroke:#40a02b
+```
+
+- **No sleeping workflows** — payments wait in Oracle `READY` status, not in Temporal
+- **Controlled throughput** — dispatcher starts ~500 workflows per 5-second cycle
+- **Jitter** — `startDelay(random(0, 4000ms))` spreads execution starts, preventing thundering herd
+
+### Insert-First Context Persistence
+
+Instead of Exposed's `upsert()` (which generates Oracle `MERGE`), context saves use `insert()` with duplicate-key fallback. This optimizes for the common path (first insert), is idempotent on Temporal activity retries, and avoids MERGE overhead.
+
+### Composition Over Inheritance
+
+The framework layer is generic and reusable. Payment-specific implementations compose framework helpers — no inheritance required. Exec workflows are pure business logic with zero framework awareness. To add a new domain (e.g., invoices): insert a config row, create an exec workflow, implement `SchedulableContextActivities`, and compose `ScheduleLifecycle` in the init workflow. No changes to the framework layer.
+
+---
+
+## Capacity Math
+
+| Metric | Before (sleep-based) | After (dispatch queue) | Basis |
+|--------|---------------------|----------------------|-------|
+| Sleeping workflows | 500,000 | 0 | Before: one `Workflow.sleep()` per payment. After: payments wait in Oracle `READY` status — zero Temporal state. |
+| Concurrent workflows | 500,000 | ~500 per cycle | After: `batchSize=500` items claimed per 5-second cycle. Only those ~500 exec workflows are active at any given time (each completes in seconds). |
+| Temporal DB rows (active) | ~2,000,000 | ~10,000 | Before: each sleeping workflow has ~4 active DB rows (workflow row, run row, timer task, history shard). 500K × 4 ≈ 2M rows. After: ~500 concurrent exec workflows × 4 rows + ~500 dispatcher/init workflows × 4 rows ≈ 4,000–10,000 active rows. |
+| DB pressure factor | 1x | ~0.005x (200x reduction) | Ratio of active Temporal DB rows: 10,000 / 2,000,000 = 0.005. |
+| Dispatch latency | All at once (thundering herd) | Staggered over jitter window | Before: all 500K workflows wake at the same timestamp. After: 500 per cycle × 5s interval, with 0–4s jitter within each batch. Full 500K dispatched over ~83 minutes (500K / 500 × 5s / 60). |
+
 ---
 
 ## Project Structure
@@ -524,19 +401,14 @@ payment-dispatch/
         │   │   └── DispatchResult.kt         # Per-item dispatch result
         │   │
         │   ├── repository/
-        │   │   ├── tables/
-        │   │   │   ├── ExecRateConfigTable.kt    # Exposed table: EXEC_RATE_CONFIG
-        │   │   │   ├── ExecQueueTable.kt         # Exposed table: PAYMENT_EXEC_QUEUE
-        │   │   │   ├── ExecContextTable.kt       # Exposed table: PAYMENT_EXEC_CONTEXT
-        │   │   │   └── DispatchAuditLogTable.kt  # Exposed table: DISPATCH_AUDIT_LOG
-        │   │   │
+        │   │   ├── tables/                   # Exposed table definitions (4 tables)
         │   │   ├── DispatchQueueRepository.kt    # Core queue ops (unified claim, status transitions)
         │   │   ├── DispatchConfigRepository.kt   # Config reader
         │   │   └── DispatchAuditRepository.kt    # Insert-only audit log
         │   │
         │   ├── context/
         │   │   ├── ExecutionContextService.kt    # Generic context interface
-        │   │   └── ExposedContextService.kt      # Exposed + Jackson implementation
+        │   │   └── ExposedContextService.kt      # Insert-first + Jackson implementation
         │   │
         │   ├── activity/
         │   │   ├── DispatcherActivities.kt       # @ActivityInterface (4 methods)
@@ -544,7 +416,7 @@ payment-dispatch/
         │   │   └── SchedulableContextActivities.kt # @ActivityInterface for context + enqueue
         │   │
         │   ├── workflow/
-        │   │   ├── ScheduleLifecycle.kt           # Composable lifecycle helper
+        │   │   ├── ScheduleLifecycle.kt           # Composable lifecycle helper for Phase A
         │   │   ├── DispatcherWorkflow.kt         # @WorkflowInterface
         │   │   └── DispatcherWorkflowImpl.kt     # 4-step dispatch cycle
         │   │
@@ -581,161 +453,6 @@ payment-dispatch/
 
 ---
 
-## Key Design Decisions
-
-### `startDelay()` Instead of `Workflow.sleep()`
-
-```mermaid
-graph LR
-    subgraph "Before — Workflow.sleep()"
-        A1["500K Workflows Created"] --> A2["500K Sleeping\n(in Temporal DB)"] --> A3["All wake at 16:00\n(thundering herd)"]
-    end
-
-    subgraph "After — startDelay()"
-        B1["Dispatcher claims\n500 items/cycle"] --> B2["WorkflowClient.start()\nwith startDelay(jitter)"] --> B3["~500 workflows\nstaggered over\njitter window"]
-    end
-
-    style A2 fill:#f38ba8,stroke:#d20f39
-    style B3 fill:#a6e3a1,stroke:#40a02b
-```
-
-- **No sleeping workflows** — payments wait in Oracle `READY` status, not in Temporal
-- **Controlled throughput** — dispatcher starts ~500 workflows per 5-second cycle
-- **Jitter** — `startDelay(random(0, 4000ms))` spreads execution starts, preventing thundering herd
-- **~200x reduction** in Temporal DB pressure
-
-### Oracle `FOR UPDATE SKIP LOCKED`
-
-Raw JDBC is used for the batch claim operation because Kotlin Exposed DSL only provides `ForUpdateOption.PostgreSQL` — there is no Oracle-specific variant.
-
-```sql
-SELECT payment_id FROM PAYMENT_EXEC_QUEUE
-WHERE item_type = ?
-  AND (
-    (queue_status = 'READY' AND scheduled_exec_time <= ? AND retry_count < ?)
-    OR
-    (queue_status = 'CLAIMED' AND claimed_at <= ?)
-  )
-ORDER BY scheduled_exec_time ASC
-FETCH FIRST ? ROWS ONLY
-FOR UPDATE SKIP LOCKED
-```
-
-- **Unified stale recovery** — single query picks up both READY items and stale CLAIMED items
-- **Contention-free** — multiple dispatcher instances can run concurrently
-- **Non-blocking** — `SKIP LOCKED` skips rows locked by other transactions
-- **Atomic** — SELECT + UPDATE within the same JDBC transaction
-- **Self-healing** — stale CLAIMED items are re-dispatched; deterministic workflow ID + `WorkflowExecutionAlreadyStarted` handler ensures correctness
-
-### Insert-First Context Persistence
-
-Instead of Exposed's `upsert()` (which generates Oracle `MERGE`), context saves use `insert()` with duplicate-key fallback:
-
-```kotlin
-try {
-    ExecContextTable.insert { ... }
-} catch (e: ExposedSQLException) {
-    if (isUniqueViolation) {
-        ExecContextTable.update({ ... }) { ... }
-    } else throw e
-}
-```
-
-- **Lower overhead** — avoids MERGE on every save
-- **Idempotent** — safe on Temporal activity retries
-- **Common path optimized** — first insert is a simple INSERT (majority case)
-
-### Context Pre-loading at Dispatch Time
-
-Instead of having each execution workflow load its context from Oracle as its first activity, context is **pre-loaded during the batch claim** and passed as a JSON string parameter to the exec workflow:
-
-```mermaid
-graph LR
-    subgraph "Before — Load in Exec Workflow"
-        C1["Dispatcher starts\nexec workflow"] --> C2["Exec workflow calls\nloadContext activity"] --> C3["Activity queries\nOracle CLOB"] --> C4["Deserialize\n+ Execute"]
-    end
-
-    subgraph "After — Pre-load at Dispatch"
-        D1["Dispatcher claims batch\n(JOIN with context table)"] --> D2["Context JSON\nalready in memory"] --> D3["Pass as workflow\nparameter"] --> D4["Deserialize locally\n+ Execute"]
-    end
-
-    style C2 fill:#f38ba8,stroke:#d20f39
-    style C3 fill:#f38ba8,stroke:#d20f39
-    style D1 fill:#a6e3a1,stroke:#40a02b
-    style D3 fill:#a6e3a1,stroke:#40a02b
-```
-
-- **Eliminates N Oracle round-trips** — context for all 500 items in a batch is loaded in a single JOIN query during `claimBatch`
-- **Simpler exec workflow** — no `loadContext` activity, no Oracle dependency at execution time
-- **One fewer failure mode** — if context load failed before, the exec workflow would be stuck in CLAIMED; now the context is guaranteed available at workflow start
-- **Context is immutable** — Phase A output doesn't change after enqueueing, so pre-loading introduces no staleness risk
-
-### Composition via Lifecycle Helpers
-
-The framework layer is generic and reusable. Payment-specific implementations compose framework helpers — no inheritance required. Exec workflows are pure business logic with zero framework awareness:
-
-```mermaid
-graph TB
-    subgraph "Framework (Generic)"
-        SL["ScheduleLifecycle\n(composable helper)"]
-        SCA["SchedulableContextActivities\n(@ActivityInterface)"]
-        ECS["ExposedContextService&lt;T&gt;"]
-        DQR["DispatchQueueRepository"]
-    end
-
-    subgraph "Payment Domain (Specific)"
-        PIW["PaymentInitWorkflowImpl\n(uses ScheduleLifecycle)"]
-        PEW["PaymentExecWorkflowImpl\n(pure business logic —\nzero framework dependency)"]
-        PCA["PaymentContextActivitiesImpl\n(implements SchedulableContextActivities)"]
-    end
-
-    PIW -->|"composes"| SL
-    PCA -->|"implements"| SCA
-    PCA -->|"composes"| ECS
-    PCA -->|"composes"| DQR
-
-    style SL fill:#89b4fa,stroke:#1e66f5
-    style SCA fill:#89b4fa,stroke:#1e66f5
-    style ECS fill:#89b4fa,stroke:#1e66f5
-    style DQR fill:#89b4fa,stroke:#1e66f5
-    style PIW fill:#a6e3a1,stroke:#40a02b
-    style PEW fill:#a6e3a1,stroke:#40a02b
-    style PCA fill:#a6e3a1,stroke:#40a02b
-```
-
-To add a new domain (e.g., invoices):
-1. Insert config row in `EXEC_RATE_CONFIG` (`item_type='INVOICE'`)
-2. Create `InvoiceExecContext`, `InvoiceInitWorkflow` (compose `ScheduleLifecycle` in init workflow)
-3. Create `InvoiceExecWorkflowImpl` — pure business logic, receives `contextJson`, no framework dependency
-4. Create `InvoiceContextActivitiesImpl` implementing `SchedulableContextActivities`
-5. No changes to the framework layer
-
----
-
-## Failure Recovery
-
-```mermaid
-flowchart TD
-    F1["Dispatcher crashes\nafter claiming batch"] -->|"Items stuck in CLAIMED"| R1["Unified Claim Query\n(next cycle picks up\nclaimed_at > threshold)"]
-    R1 -->|"Re-claimed and\nre-dispatched"| R1A["WorkflowClient.start()"]
-    R1A -->|"Workflow not running"| R1B["Starts successfully\n→ DISPATCHED"]
-    R1A -->|"Already running"| R1C["WorkflowExecutionAlreadyStarted\n→ DISPATCHED (dedup)"]
-
-    F2["WorkflowClient.start()\nfails for an item"] --> R2["Reset to READY\nimmediately\n(retry_count++)"]
-
-    F3["Exec workflow fails\n(after DISPATCHED)"] --> R3A["Temporal manages retries,\ntimeouts, and failure.\nQueue stays DISPATCHED —\nno callback to Oracle needed."]
-
-    F4["Context pre-load fails\n(during claimBatch)"] -->|"Batch claim fails entirely\nnext cycle retries"| R2B["Items remain CLAIMED\n→ picked up as stale"]
-    R2B --> R1
-
-    style R1B fill:#a6e3a1,stroke:#40a02b
-    style R1C fill:#a6e3a1,stroke:#40a02b
-    style R2 fill:#a6e3a1,stroke:#40a02b
-    style R3A fill:#89b4fa,stroke:#1e66f5
-```
-
----
-
 ## Temporal Workers
 
 Three dedicated workers with isolated task queues:
@@ -752,19 +469,12 @@ Three dedicated workers with isolated task queues:
 
 Exported via Micrometer to Prometheus at `/q/metrics`.
 
-### Counters
-
-| Metric | Description |
-|--------|-------------|
-| `dispatch.batch.claimed` | Total items claimed across all batches |
-| `dispatch.workflow.started` | Exec workflows successfully started |
-| `dispatch.workflow.start.failures` | Exec workflow start failures |
-
-### Timers
-
-| Metric | Description |
-|--------|-------------|
-| `dispatch.cycle.duration` | Full dispatch cycle duration (seconds) |
+| Metric | Type | Description |
+|--------|------|-------------|
+| `dispatch.batch.claimed` | Counter | Total items claimed across all batches |
+| `dispatch.workflow.started` | Counter | Exec workflows successfully started |
+| `dispatch.workflow.start.failures` | Counter | Exec workflow start failures |
+| `dispatch.cycle.duration` | Timer | Full dispatch cycle duration (seconds) |
 
 ### Recommended Alerts
 
@@ -779,39 +489,16 @@ Exported via Micrometer to Prometheus at `/q/metrics`.
 
 All dispatch parameters are stored in `EXEC_RATE_CONFIG` and read each cycle — **no redeploy needed**.
 
-### Tuning batch size
-
 ```sql
+-- Tune batch size (takes effect within 5 seconds)
 UPDATE EXEC_RATE_CONFIG SET batch_size = 1000 WHERE item_type = 'PAYMENT';
--- Takes effect on next dispatch cycle (within 5 seconds)
-```
 
-### Kill switch
-
-```sql
+-- Kill switch (items remain READY, not lost)
 UPDATE EXEC_RATE_CONFIG SET enabled = 0 WHERE item_type = 'PAYMENT';
--- Dispatcher reads config, sees enabled=0, returns immediately
--- Items remain in READY status (not lost)
-```
 
-### Adjusting jitter window
-
-```sql
+-- Adjust jitter window
 UPDATE EXEC_RATE_CONFIG SET jitter_window_ms = 8000 WHERE item_type = 'PAYMENT';
--- Exec workflows will now spread starts over 0-8 seconds instead of 0-4 seconds
 ```
-
----
-
-## Capacity Math
-
-| Metric | Before (sleep-based) | After (dispatch queue) |
-|--------|---------------------|----------------------|
-| Sleeping workflows | 500,000 | 0 |
-| Concurrent workflows | 500,000 | ~500 per cycle |
-| Temporal DB rows (active) | ~2,000,000 | ~10,000 |
-| DB pressure factor | 1x | ~0.005x (200x reduction) |
-| Dispatch latency | All at once (thundering herd) | Staggered over jitter window |
 
 ---
 
@@ -846,8 +533,6 @@ UPDATE EXEC_RATE_CONFIG SET jitter_window_ms = 8000 WHERE item_type = 'PAYMENT';
 ```
 
 ### Run Database Migration
-
-Execute the DDL script against your Oracle instance:
 
 ```bash
 sqlplus dispatch_user/dispatch_pass@//localhost:1521/XEPDB1 @src/main/resources/db/migration/V1__create_dispatch_tables.sql
